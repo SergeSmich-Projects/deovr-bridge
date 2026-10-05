@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+cache.sqlite3
+*cookies*.txt
+debug_*.html
+login_debug.html
+resp.json
+new.txt
+.env
