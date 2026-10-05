@@ -9,7 +9,9 @@ import threading
 
 import config
 
-_lock = threading.Lock()
+_lock = threading.RLock()
+_db_initialized = False
+_db_initialized_path = None
 
 
 def _conn():
@@ -26,6 +28,7 @@ def _ensure_column(conn, table: str, column: str, coltype: str):
 
 
 def init_db():
+    global _db_initialized, _db_initialized_path
     with _lock, _conn() as conn:
         conn.execute(
             """
@@ -40,6 +43,7 @@ def init_db():
                 screen_type TEXT,
                 stereo_mode TEXT,
                 video_length INTEGER DEFAULT 0,
+                video_height INTEGER,
                 updated_at INTEGER,
                 -- кэш уже построенного стрим-URL из TorrServe, чтобы не пересчитывать каждый раз
                 stream_url TEXT,
@@ -64,6 +68,11 @@ def init_db():
         # до этой миграции) - они уходят в конец списка, а не притворяются
         # новыми.
         _ensure_column(conn, "items", "source_rank", "INTEGER DEFAULT 999999999")
+
+        # Вертикальное разрешение из поля "Тип видео" (например, 3072p). Оно нужно
+        # не только для фильтра MIN_VIDEO_HEIGHT_PX в scraper.py, но и для DeoVR:
+        # /video/<id> должен отдавать реальный resolution, а не старый хардкод 1080.
+        _ensure_column(conn, "items", "video_height", "INTEGER")
 
         # сиды/личи со страницы списка раздела (NULL = неизвестно - у xxxclub их
         # в принципе нет, это DHT-магнет без страницы трекера) и скриншоты из
@@ -108,14 +117,31 @@ def init_db():
             """
         )
 
+        _db_initialized = True
+        _db_initialized_path = config.DB_PATH
+
+
+def ensure_db():
+    """Гарантирует, что схема БД создана и все мягкие миграции применены.
+
+    app.py вызывает init_db() при старте, но вспомогательные скрипты и тесты могут
+    обращаться к store напрямую. Поэтому публичные функции дополнительно вызывают
+    ensure_db(), чтобы старая cache.sqlite3 пользователя не падала на новых
+    колонках вроде source_rank/site/video_height.
+    """
+    if not _db_initialized or _db_initialized_path != config.DB_PATH:
+        init_db()
+
 
 def get_meta(key: str, default=None):
+    ensure_db()
     with _lock, _conn() as conn:
         r = conn.execute("SELECT value FROM kv_meta WHERE key = ?", (key,)).fetchone()
         return r["value"] if r else default
 
 
 def set_meta(key: str, value: str):
+    ensure_db()
     with _lock, _conn() as conn:
         conn.execute(
             """
@@ -127,14 +153,15 @@ def set_meta(key: str, value: str):
 
 
 def upsert_item(item: dict):
+    ensure_db()
     with _lock, _conn() as conn:
         conn.execute(
             """
             INSERT INTO items (id, topic_id, title, tags, thumbnail_url, source_type, source,
-                                screen_type, stereo_mode, video_length, updated_at,
+                                screen_type, stereo_mode, video_length, video_height, updated_at,
                                 performers, studio, site, source_rank, seeders, leechers, screenshots)
             VALUES (:id, :topic_id, :title, :tags, :thumbnail_url, :source_type, :source,
-                    :screen_type, :stereo_mode, :video_length, :updated_at,
+                    :screen_type, :stereo_mode, :video_length, :video_height, :updated_at,
                     :performers, :studio, :site, :source_rank, :seeders, :leechers, :screenshots)
             ON CONFLICT(id) DO UPDATE SET
                 topic_id=excluded.topic_id,
@@ -146,6 +173,7 @@ def upsert_item(item: dict):
                 screen_type=excluded.screen_type,
                 stereo_mode=excluded.stereo_mode,
                 video_length=excluded.video_length,
+                video_height=excluded.video_height,
                 updated_at=excluded.updated_at,
                 performers=excluded.performers,
                 studio=excluded.studio,
@@ -166,6 +194,7 @@ def upsert_item(item: dict):
                 "screen_type": item.get("screen_type", config.DEFAULT_SCREEN_TYPE),
                 "stereo_mode": item.get("stereo_mode", config.DEFAULT_STEREO_MODE),
                 "video_length": item.get("video_length", 0),
+                "video_height": _optional_int(item.get("video_height")),
                 "updated_at": int(time.time()),
                 "performers": json.dumps(item.get("performers", []), ensure_ascii=False),
                 "studio": json.dumps(item.get("studio", []), ensure_ascii=False),
@@ -178,16 +207,44 @@ def upsert_item(item: dict):
         )
 
 
+def _optional_int(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _json_list(value) -> list:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def _row_to_dict(r):
     d = dict(r)
-    d["tags"] = json.loads(d["tags"] or "[]")
-    d["performers"] = json.loads(d.get("performers") or "[]")
-    d["studio"] = json.loads(d.get("studio") or "[]")
-    d["screenshots"] = json.loads(d.get("screenshots") or "[]")
+    d["tags"] = _json_list(d.get("tags"))
+    d["performers"] = _json_list(d.get("performers"))
+    d["studio"] = _json_list(d.get("studio"))
+    d["screenshots"] = _json_list(d.get("screenshots"))
+    d["screen_type"] = d.get("screen_type") or config.DEFAULT_SCREEN_TYPE
+    d["stereo_mode"] = d.get("stereo_mode") or config.DEFAULT_STEREO_MODE
+    d["video_length"] = int(d.get("video_length") or 0)
+    d["video_height"] = _optional_int(d.get("video_height"))
+    d["source_rank"] = d.get("source_rank") if d.get("source_rank") is not None else 999999999
+    d["site"] = d.get("site") or "pornolab"
     return d
 
 
 def all_items():
+    ensure_db()
     with _lock, _conn() as conn:
         # ВАЖНО: порядок = как на самом трекере (source_rank, меньше - новее/выше
         # в разделе), а НЕ updated_at (момент, когда МЫ записали карточку к себе -
@@ -197,7 +254,7 @@ def all_items():
         # используем updated_at как запасной критерий, просто чтобы не было
         # полностью случайного порядка внутри этой группы.
         rows = conn.execute(
-            "SELECT * FROM items ORDER BY source_rank ASC, updated_at DESC"
+            "SELECT * FROM items ORDER BY COALESCE(source_rank, 999999999) ASC, updated_at DESC"
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -206,11 +263,13 @@ def set_source_rank(item_id: str, rank: int):
     """Точечно обновляет ранг уже существующей карточки - используется разовым
     скриптом переиндексации (rerank_existing.py), который заново проходит
     список раздела ТОЛЬКО ради актуальных позиций, не трогая остальные поля."""
+    ensure_db()
     with _lock, _conn() as conn:
         conn.execute("UPDATE items SET source_rank = ? WHERE id = ?", (rank, item_id))
 
 
 def get_item(item_id: str):
+    ensure_db()
     with _lock, _conn() as conn:
         r = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
         if not r:
@@ -221,12 +280,14 @@ def get_item(item_id: str):
 def item_exists(item_id: str) -> bool:
     """Быстрая проверка без разбора JSON-полей - используется краулером, чтобы не
     перескачивать и не парсить страницу темы, которая уже есть в кэше."""
+    ensure_db()
     with _lock, _conn() as conn:
         r = conn.execute("SELECT 1 FROM items WHERE id = ?", (item_id,)).fetchone()
         return r is not None
 
 
 def save_stream_url(item_id: str, stream_url: str):
+    ensure_db()
     with _lock, _conn() as conn:
         conn.execute(
             "UPDATE items SET stream_url = ?, stream_built_at = ? WHERE id = ?",
@@ -243,6 +304,7 @@ def all_tags():
 
 
 def get_crawl_state(section_url: str) -> dict:
+    ensure_db()
     with _lock, _conn() as conn:
         r = conn.execute(
             "SELECT * FROM crawl_state WHERE section_url = ?", (section_url,)
@@ -261,6 +323,7 @@ def save_crawl_state(section_url: str, cursor_page: int, complete: bool = False,
     чтобы строить source_rank карточек (см. комментарий у items.source_rank в
     init_db()). Если None - оставляем прежнее значение как есть (не трогаем).
     """
+    ensure_db()
     with _lock, _conn() as conn:
         if pages_fetched_seq is None:
             r = conn.execute(

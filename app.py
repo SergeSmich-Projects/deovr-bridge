@@ -22,6 +22,7 @@ import logging
 import threading
 import time
 import urllib.parse
+import zlib
 
 from flask import Flask, jsonify, request, Response, redirect
 
@@ -78,15 +79,57 @@ def _seed_leech_suffix(item: dict) -> str:
     return f" [S:{s} L:{l}]"
 
 
+def _deovr_response(dto: dict):
+    """Единая обёртка для DeoVR JSON.
+
+    jsonify и так выставляет application/json, но явно фиксируем charset/CORS/no-store:
+    это убирает лишние переменные при диагностике ситуаций, когда DeoVR вместо
+    Selection Scene показывает сырой текст ответа.
+    """
+    resp = jsonify(dto)
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _deovr_numeric_id(item_id) -> int:
+    """DeoVR-документация описывает поле id как число.
+
+    В нашей БД id текстовый: у pornolab это обычно "12345", а у xxxclub - "xc_...".
+    Для JSON DeoVR оставляем стабильный числовой id, а настоящая строка id остаётся
+    в URL (/video/<id>) и не теряется.
+    """
+    raw = str(item_id)
+    if raw.isdigit():
+        return int(raw)
+    return 1_000_000_000 + (zlib.crc32(raw.encode("utf-8")) % 1_000_000_000)
+
+
+def _deovr_resolution(item: dict) -> int:
+    try:
+        height = int(item.get("video_height") or 0)
+    except (TypeError, ValueError):
+        height = 0
+    return height if height > 0 else 1080
+
+
 def _item_to_card(item: dict, base_url: str) -> dict:
-    """Короткий формат карточки для списка (экономит трафик, DeoVR подтянет video_url при клике)."""
+    """Короткий формат карточки для списка.
+
+    По официальному shortened format DeoVR в списке нужны только title,
+    videoLength, thumbnailUrl и video_url. Раньше мы добавляли ещё строковый id
+    (например, "xc_123"), но у DeoVR id типизирован как number; на некоторых
+    версиях плеера это может сорвать распознавание JSON как библиотеки и показать
+    сырой текст. Поэтому id отдаём только в полной карточке /video/<id>, уже как
+    число через _deovr_numeric_id().
+    """
     thumb = item["thumbnail_url"] or f"{base_url}/static/placeholder.jpg"
     return {
-        "id": item["id"],
         "title": item["title"] + _seed_leech_suffix(item),
         "videoLength": item.get("video_length") or 0,
         "thumbnailUrl": thumb,
-        "video_url": f"{base_url}/video/{item['id']}",
+        "video_url": f"{base_url}/video/{urllib.parse.quote(str(item['id']), safe='')}",
     }
 
 
@@ -393,8 +436,8 @@ def _prefixed(label: str, name: str) -> str:
     return f"{label}: {name}" if label else name
 
 
-@app.get("/deovr")
-@app.get("/")
+@app.route("/deovr", methods=["GET", "POST"])
+@app.route("/", methods=["GET", "POST"])
 def deovr_root():
     """
     Источники НЕ смешиваются между собой (так попросил пользователь) - у каждого
@@ -441,10 +484,10 @@ def deovr_root():
                 "list": [_item_to_card(i, base_url) for i in tag_items[: config.MAX_SCENE_ITEMS]],
             })
 
-    return jsonify({"scenes": scenes, "authorized": "0"})
+    return _deovr_response({"scenes": scenes, "authorized": 0})
 
 
-@app.get("/video/<item_id>")
+@app.route("/video/<item_id>", methods=["GET", "POST"])
 def video_detail(item_id):
     """
     ВАЖНО: этот адрес плеер (DeoVR) дёргает для КАЖДОЙ карточки, которую
@@ -461,17 +504,20 @@ def video_detail(item_id):
 
     stream_url = f"{_base_url()}/stream/{urllib.parse.quote(str(item_id), safe='')}"
 
-    return jsonify({
-        "id": item_id,
+    resolution = _deovr_resolution(item)
+
+    return _deovr_response({
+        "authorized": 0,
+        "id": _deovr_numeric_id(item_id),
         "title": item["title"] + _seed_leech_suffix(item),
         "is3d": True,
         "screenType": item["screen_type"],
         "stereoMode": item["stereo_mode"],
         "videoLength": item.get("video_length") or 0,
-        "thumbnailUrl": item["thumbnail_url"],
+        "thumbnailUrl": item["thumbnail_url"] or f"{_base_url()}/static/placeholder.jpg",
         "encodings": [{
             "name": "h264",
-            "videoSources": [{"resolution": 1080, "url": stream_url}],
+            "videoSources": [{"resolution": resolution, "height": resolution, "url": stream_url}],
         }],
     })
 
@@ -584,7 +630,8 @@ def heresphere_video(item_id):
     # резолв - только в /stream/<id>, когда плеер действительно начнёт читать
     # видео-поток (нажали play).
     stream_url = f"{base_url}/stream/{urllib.parse.quote(str(item_id), safe='')}"
-    dto["media"] = [{"name": "TorrServe", "sources": [{"resolution": 1080, "url": stream_url}]}]
+    resolution = _deovr_resolution(item)
+    dto["media"] = [{"name": "TorrServe", "sources": [{"resolution": resolution, "url": stream_url}]}]
 
     resp = jsonify(dto)
     resp.headers["HereSphere-JSON-Version"] = "1"
