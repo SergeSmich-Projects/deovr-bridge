@@ -212,13 +212,23 @@ class DeoVRContractTests(unittest.TestCase):
         self.assertEqual(detail["status"]["code"], 1)
         data = detail["data"]
         self.assertEqual(data["id"], "pl_42")
-        self.assertEqual(data["studio"][0]["title"], "Studio A")
+        self.assertEqual(data["studio"]["title"], "Studio A")
         self.assertEqual(data["actors"][0]["title"], "Actor One")
         link = data["details"][0]["links"][0]
         self.assertEqual(link["url"], "http://192.168.1.2:9999/stream/pl_42")
         self.assertEqual(link["projection"], "180")
         self.assertEqual(link["stereo"], "LR")
+        self.assertTrue(link["is_stream"])
+        self.assertTrue(link["is_download"])
         self.assertEqual(link["quality_name"], "3072p")
+
+        # PLAY'A in the wild may send literal &amp; separators. Support those too.
+        studio_id = data["studio"]["id"]
+        filtered = client.get(
+            f"/api/playa/v2/videos?page-index=0&amp;page-size=10&amp;studio={studio_id}",
+            headers={"Host": "192.168.1.2:9999"},
+        ).get_json()
+        self.assertEqual(filtered["data"]["item_total"], 1)
 
         actors = client.get("/api/playa/v2/actors", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertEqual(actors["data"]["content"][0]["title"], "Actor One")

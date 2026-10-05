@@ -733,6 +733,16 @@ def _playa_not_found(message: str = "Not found"):
     return _playa_response(code=404, message=message)
 
 
+def _playa_arg(name: str, default: str = "") -> str:
+    """Читает query-параметр PLAY'A.
+
+    В логах реального клиента уже встретились URL с HTML-escaped разделителями
+    `&amp;` внутри query string. Flask в таком случае видит ключи вида
+    `amp;page-size`, поэтому для устойчивости поддерживаем оба варианта.
+    """
+    return request.args.get(name, request.args.get(f"amp;{name}", default))
+
+
 def _playa_entity_id(kind: str, title: str) -> str:
     digest = hashlib.sha1(f"{kind}:{title}".encode("utf-8")).hexdigest()[:16]
     return f"{kind}_{digest}"
@@ -787,7 +797,7 @@ def _playa_video_link(item: dict, base_url: str) -> dict:
     item_id = str(item["id"])
     return {
         "is_stream": True,
-        "is_download": False,
+        "is_download": True,
         "url": f"{base_url}/stream/{urllib.parse.quote(item_id, safe='')}",
         "projection": _PLAYA_PROJECTION.get((item.get("screen_type") or "").lower(), "180"),
         "stereo": _PLAYA_STEREO.get((item.get("stereo_mode") or "").lower(), "LR"),
@@ -832,6 +842,14 @@ def _playa_description(item: dict) -> str:
     return "\n".join(lines)
 
 
+def _playa_studio_ref(item: dict):
+    studios = [title for title in item.get("studio", []) if title]
+    if not studios:
+        return None
+    title = studios[0]
+    return {"id": _playa_entity_id("studio", title), "title": title}
+
+
 def _playa_video_view(item: dict, base_url: str) -> dict:
     item_id = str(item["id"])
     return {
@@ -842,10 +860,10 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
         "description": _playa_description(item),
         "preview_image": _image_url(item, base_url),
         "release_date": int(item.get("updated_at") or 0),
-        "studio": [
-            {"id": _playa_entity_id("studio", title), "title": title}
-            for title in item.get("studio", [])
-        ],
+        # В референсной реализации PLAY'A API v2 поле VideoView.studio - ОДИН
+        # объект, не массив. Если отдать массив, карточка открывается, но клиент
+        # может не распарсить detail-модель и не дойти до ссылки воспроизведения.
+        "studio": _playa_studio_ref(item),
         "categories": [
             {"id": _playa_entity_id("category", title), "title": title}
             for title in item.get("tags", [])
@@ -867,11 +885,11 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
 
 def _playa_page_args(default_size: int = 60) -> tuple:
     try:
-        page_index = int(request.args.get("page-index", 0))
+        page_index = int(_playa_arg("page-index", 0))
     except (TypeError, ValueError):
         page_index = 0
     try:
-        page_size = int(request.args.get("page-size", default_size))
+        page_size = int(_playa_arg("page-size", default_size))
     except (TypeError, ValueError):
         page_size = default_size
     page_index = max(page_index, 0)
@@ -917,12 +935,12 @@ def _playa_collect_entities(items: list) -> dict:
 def _playa_filter_videos(items: list) -> list:
     maps = _playa_collect_entities(items)
 
-    title = (request.args.get("title") or "").strip().casefold()
-    actor_id = (request.args.get("actor") or "").strip()
-    studio_id = (request.args.get("studio") or "").strip()
-    included_categories = _csv_ids(request.args.get("included-categories") or "")
-    excluded_categories = _csv_ids(request.args.get("excluded-categories") or "")
-    included_statuses = _csv_ids(request.args.get("included-statuses") or "")
+    title = (_playa_arg("title") or "").strip().casefold()
+    actor_id = (_playa_arg("actor") or "").strip()
+    studio_id = (_playa_arg("studio") or "").strip()
+    included_categories = _csv_ids(_playa_arg("included-categories") or "")
+    excluded_categories = _csv_ids(_playa_arg("excluded-categories") or "")
+    included_statuses = _csv_ids(_playa_arg("included-statuses") or "")
 
     actor_name = maps["actors"].get(actor_id) if actor_id else None
     studio_name = maps["studios"].get(studio_id) if studio_id else None
@@ -957,8 +975,8 @@ def _playa_filter_videos(items: list) -> list:
             continue
         filtered.append(item)
 
-    order = (request.args.get("order") or "").strip().casefold()
-    direction = (request.args.get("direction") or "asc").strip().casefold()
+    order = (_playa_arg("order") or "").strip().casefold()
+    direction = (_playa_arg("direction", "asc") or "asc").strip().casefold()
     reverse = direction == "desc"
     if order == "title":
         filtered.sort(key=lambda x: (x.get("title") or "").casefold(), reverse=reverse)
@@ -988,11 +1006,11 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str) -> 
             entry["count"] += 1
             entry["studios"].update(item.get("studio", []))
     entries = list(by_title.values())
-    title_filter = (request.args.get("title") or "").strip().casefold()
+    title_filter = (_playa_arg("title") or "").strip().casefold()
     if title_filter:
         entries = [entry for entry in entries if title_filter in entry["title"].casefold()]
-    order = (request.args.get("order") or "title").strip().casefold()
-    direction = (request.args.get("direction") or "asc").strip().casefold()
+    order = (_playa_arg("order", "title") or "title").strip().casefold()
+    direction = (_playa_arg("direction", "asc") or "asc").strip().casefold()
     reverse = direction == "desc"
     if order == "popularity":
         entries.sort(key=lambda x: (x["count"], x["title"].casefold()), reverse=reverse)
