@@ -18,7 +18,10 @@ Flask-сервер - "мост" между форумом, TorrServe и DeoVR.
      тогда достаточно ввести в DeoVR просто http://<IP-компьютера>:9999
 """
 
+import base64
+import hashlib
 import logging
+import math
 import threading
 import time
 import urllib.parse
@@ -62,6 +65,36 @@ def _torrserve_public_base_url() -> str:
     host = request.host.split(":")[0]
     scheme = request.scheme
     return f"{scheme}://{host}:{config.TORRSERVE_PUBLIC_PORT}"
+
+
+def _is_item_visible(item: dict) -> bool:
+    """Единый фильтр выдачи библиотеки.
+
+    Скрапер может продолжать наполнять БД из всех источников, но некоторые
+    источники можно временно скрыть из плееров через config.HIDDEN_LIBRARY_SITE_IDS.
+    Сейчас по умолчанию скрыт xxxclub.
+    """
+    return (item.get("site") or "pornolab") not in config.HIDDEN_LIBRARY_SITE_IDS
+
+
+def _library_items() -> list:
+    return [item for item in store.all_items() if _is_item_visible(item)]
+
+
+def _get_library_item(item_id: str):
+    item = store.get_item(item_id)
+    if not item or not _is_item_visible(item):
+        return None
+    return item
+
+
+def _placeholder_url(base_url: str) -> str:
+    return f"{base_url}/placeholder.png"
+
+
+def _image_url(item: dict, base_url: str) -> str:
+    thumb = (item.get("thumbnail_url") or "").strip()
+    return thumb or _placeholder_url(base_url)
 
 
 def _seed_leech_suffix(item: dict) -> str:
@@ -124,11 +157,10 @@ def _item_to_card(item: dict, base_url: str) -> dict:
     сырой текст. Поэтому id отдаём только в полной карточке /video/<id>, уже как
     число через _deovr_numeric_id().
     """
-    thumb = item["thumbnail_url"] or f"{base_url}/static/placeholder.jpg"
     return {
         "title": item["title"] + _seed_leech_suffix(item),
         "videoLength": item.get("video_length") or 0,
-        "thumbnailUrl": thumb,
+        "thumbnailUrl": _image_url(item, base_url),
         "video_url": f"{base_url}/video/{urllib.parse.quote(str(item['id']), safe='')}",
     }
 
@@ -388,7 +420,25 @@ def _heresphere_date_added(item: dict) -> str:
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "items": len(store.all_items())})
+    all_items = store.all_items()
+    visible_items = [item for item in all_items if _is_item_visible(item)]
+    return jsonify({
+        "status": "ok",
+        "items": len(visible_items),
+        "items_total": len(all_items),
+        "hidden_sites": sorted(config.HIDDEN_LIBRARY_SITE_IDS),
+    })
+
+
+_PLACEHOLDER_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
+
+@app.get("/placeholder.png")
+@app.get("/static/placeholder.jpg")
+def placeholder_image():
+    return Response(_PLACEHOLDER_PNG, mimetype="image/png")
 
 
 @app.get("/debug/sites")
@@ -446,7 +496,7 @@ def deovr_root():
     карточек.
     """
     base_url = _base_url()
-    all_items = store.all_items()
+    all_items = _library_items()
 
     items_by_site = {}
     for i in all_items:
@@ -498,11 +548,12 @@ def video_detail(item_id):
     резолв, но ТОЛЬКО когда плеер по-настоящему начинает читать видео-поток
     (т.е. реально нажали play) - см. stream_redirect().
     """
-    item = store.get_item(item_id)
+    item = _get_library_item(item_id)
     if not item:
         return jsonify({"error": "not found"}), 404
 
-    stream_url = f"{_base_url()}/stream/{urllib.parse.quote(str(item_id), safe='')}"
+    base_url = _base_url()
+    stream_url = f"{base_url}/stream/{urllib.parse.quote(str(item_id), safe='')}"
 
     resolution = _deovr_resolution(item)
 
@@ -514,7 +565,7 @@ def video_detail(item_id):
         "screenType": item["screen_type"],
         "stereoMode": item["stereo_mode"],
         "videoLength": item.get("video_length") or 0,
-        "thumbnailUrl": item["thumbnail_url"] or f"{_base_url()}/static/placeholder.jpg",
+        "thumbnailUrl": _image_url(item, base_url),
         "encodings": [{
             "name": "h264",
             "videoSources": [{"resolution": resolution, "height": resolution, "url": stream_url}],
@@ -531,7 +582,7 @@ def stream_redirect(item_id):
     при подгрузке карточки/метаданных (см. комментарий в video_detail()).
     Резолвим и делаем редирект на настоящий адрес TorrServe.
     """
-    item = store.get_item(item_id)
+    item = _get_library_item(item_id)
     if not item:
         return jsonify({"error": "not found"}), 404
 
@@ -547,7 +598,7 @@ def stream_redirect(item_id):
 def _heresphere_library(base_url: str) -> list:
     """Как и в /deovr - отдельная вкладка библиотеки на каждый источник, без смешивания."""
     items_by_site = {}
-    for i in store.all_items():
+    for i in _library_items():
         items_by_site.setdefault(i.get("site") or "pornolab", []).append(i)
 
     library = []
@@ -579,7 +630,7 @@ def heresphere_scan():
     строит свою боковую панель тегов/актрис, не дёргая каждое видео по отдельности."""
     base_url = _base_url()
     scan_data = []
-    for i in store.all_items():
+    for i in _library_items():
         scan_data.append({
             "link": _heresphere_video_url(base_url, i["id"]),
             "title": i["title"],
@@ -600,7 +651,7 @@ def heresphere_events(item_id):
 
 @app.route("/heresphere/<item_id>", methods=["GET", "POST"])
 def heresphere_video(item_id):
-    item = store.get_item(item_id)
+    item = _get_library_item(item_id)
     if not item:
         return jsonify({"access": -1}), 404
 
@@ -611,7 +662,7 @@ def heresphere_video(item_id):
     dto = {
         "access": 1,
         "title": item["title"] + _seed_leech_suffix(item),
-        "thumbnailImage": item["thumbnail_url"] or f"{base_url}/static/placeholder.jpg",
+        "thumbnailImage": _image_url(item, base_url),
         "dateAdded": _heresphere_date_added(item),
         "duration": (item.get("video_length") or 0) * 1000,
         "projection": projection,
@@ -638,9 +689,458 @@ def heresphere_video(item_id):
     return resp
 
 
+# --- PLAY'A VR API v2 ---------------------------------------------------
+# Документация: https://github.com/Playa-vr/PLAYA-API-v2/blob/main/docs.md
+# PLAY'A при добавлении сайта автоматически обращается к /api/playa/v2/version,
+# затем /config и /videos. Аутентификацию отключаем (auth=false), чтобы мост
+# работал как локальная гостевая библиотека без JWT/логина.
+_PLAYA_PREFIX = "/api/playa/v2"
+
+_PLAYA_PROJECTION = {
+    "flat": "FLT",
+    "dome": "180",
+    "sphere": "360",
+    "fisheye": "FSH",
+    "mkx200": "FSH",
+    "rf52": "FSH",
+}
+_PLAYA_STEREO = {
+    "sbs": "LR",
+    "lr": "LR",
+    "tb": "TB",
+    "overunder": "TB",
+    "off": "MN",
+    "mono": "MN",
+    "mn": "MN",
+}
+
+
+def _playa_response(data=None, code: int = 1, message: str = None):
+    status = {"code": code}
+    if message:
+        status["message"] = message
+    payload = {"status": status}
+    if code == 1 and data is not None:
+        payload["data"] = data
+    resp = jsonify(payload)
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _playa_not_found(message: str = "Not found"):
+    return _playa_response(code=404, message=message)
+
+
+def _playa_entity_id(kind: str, title: str) -> str:
+    digest = hashlib.sha1(f"{kind}:{title}".encode("utf-8")).hexdigest()[:16]
+    return f"{kind}_{digest}"
+
+
+def _playa_status(item: dict) -> str:
+    seeders = item.get("seeders")
+    leechers = item.get("leechers")
+    if seeders is None and leechers is None:
+        return ""
+    s = seeders if seeders is not None else "?"
+    l = leechers if leechers is not None else "?"
+    return f"S:{s} L:{l}"
+
+
+def _playa_subtitle(item: dict) -> str:
+    studios = [x for x in item.get("studio", []) if x]
+    performers = [x for x in item.get("performers", []) if x]
+    if studios and performers:
+        return f"{', '.join(studios[:2])} · {', '.join(performers[:2])}"
+    if studios:
+        return ", ".join(studios[:3])
+    if performers:
+        return ", ".join(performers[:3])
+    site_id = item.get("site") or "pornolab"
+    return _site_label(site_id) or site_id
+
+
+def _playa_quality_name(item: dict) -> str:
+    height = _deovr_resolution(item)
+    return f"{height}p" if height else "1080p"
+
+
+def _playa_quality_order(item: dict) -> int:
+    height = _deovr_resolution(item)
+    if height >= 7680:
+        return 85
+    if height >= 6720:
+        return 75
+    if height >= 5760:
+        return 65
+    if height >= 4800:
+        return 55
+    if height >= 3840:
+        return 45
+    if height >= 2880:
+        return 35
+    return 25
+
+
+def _playa_video_link(item: dict, base_url: str) -> dict:
+    item_id = str(item["id"])
+    return {
+        "is_stream": True,
+        "is_download": False,
+        "url": f"{base_url}/stream/{urllib.parse.quote(item_id, safe='')}",
+        "projection": _PLAYA_PROJECTION.get((item.get("screen_type") or "").lower(), "180"),
+        "stereo": _PLAYA_STEREO.get((item.get("stereo_mode") or "").lower(), "LR"),
+        "quality_name": _playa_quality_name(item),
+        "quality_order": _playa_quality_order(item),
+    }
+
+
+def _playa_list_view(item: dict, base_url: str) -> dict:
+    return {
+        "id": str(item["id"]),
+        "title": item["title"],
+        "subtitle": _playa_subtitle(item),
+        "status": _playa_status(item),
+        "preview_image": _image_url(item, base_url),
+        "has_scripts": False,
+        "release_date": int(item.get("updated_at") or 0),
+        "details": [
+            {
+                "type": "full",
+                "duration_seconds": int(item.get("video_length") or 0),
+                "has_scripts": False,
+                "transparency_mode": 0,
+            }
+        ],
+    }
+
+
+def _playa_description(item: dict) -> str:
+    lines = []
+    if item.get("studio"):
+        lines.append("Studios: " + ", ".join(item["studio"]))
+    if item.get("performers"):
+        lines.append("Actors: " + ", ".join(item["performers"]))
+    if item.get("tags"):
+        lines.append("Categories: " + ", ".join(item["tags"]))
+    if _playa_status(item):
+        lines.append("Peers: " + _playa_status(item))
+    if item.get("video_height"):
+        lines.append(f"Resolution: {item['video_height']}p")
+    lines.append(f"Source: {item.get('site') or 'pornolab'} / {item.get('topic_id') or item.get('id')}")
+    return "\n".join(lines)
+
+
+def _playa_video_view(item: dict, base_url: str) -> dict:
+    item_id = str(item["id"])
+    return {
+        "id": item_id,
+        "title": item["title"],
+        "subtitle": _playa_subtitle(item),
+        "status": _playa_status(item),
+        "description": _playa_description(item),
+        "preview_image": _image_url(item, base_url),
+        "release_date": int(item.get("updated_at") or 0),
+        "studio": [
+            {"id": _playa_entity_id("studio", title), "title": title}
+            for title in item.get("studio", [])
+        ],
+        "categories": [
+            {"id": _playa_entity_id("category", title), "title": title}
+            for title in item.get("tags", [])
+        ],
+        "actors": [
+            {"id": _playa_entity_id("actor", title), "title": title}
+            for title in item.get("performers", [])
+        ],
+        "views": 0,
+        "details": [
+            {
+                "type": "full",
+                "duration_seconds": int(item.get("video_length") or 0),
+                "links": [_playa_video_link(item, base_url)],
+            }
+        ],
+    }
+
+
+def _playa_page_args(default_size: int = 60) -> tuple:
+    try:
+        page_index = int(request.args.get("page-index", 0))
+    except (TypeError, ValueError):
+        page_index = 0
+    try:
+        page_size = int(request.args.get("page-size", default_size))
+    except (TypeError, ValueError):
+        page_size = default_size
+    page_index = max(page_index, 0)
+    page_size = min(max(page_size, 1), 500)
+    return page_index, page_size
+
+
+def _playa_page(items: list, page_index: int, page_size: int) -> dict:
+    total = len(items)
+    page_total = max(1, math.ceil(total / page_size))
+    start = page_index * page_size
+    end = start + page_size
+    return {
+        "page_index": page_index,
+        "page_size": page_size,
+        "page_total": page_total,
+        "item_total": total,
+        "content": items[start:end] if start < total else [],
+    }
+
+
+def _csv_ids(value: str) -> list:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _playa_entity_map(kind: str, values: list) -> dict:
+    return {_playa_entity_id(kind, value): value for value in values if value}
+
+
+def _playa_collect_entities(items: list) -> dict:
+    tags = sorted({tag for item in items for tag in item.get("tags", []) if tag}, key=str.casefold)
+    actors = sorted({actor for item in items for actor in item.get("performers", []) if actor}, key=str.casefold)
+    studios = sorted({studio for item in items for studio in item.get("studio", []) if studio}, key=str.casefold)
+    return {
+        "categories": _playa_entity_map("category", tags),
+        "actors": _playa_entity_map("actor", actors),
+        "studios": _playa_entity_map("studio", studios),
+    }
+
+
+def _playa_filter_videos(items: list) -> list:
+    maps = _playa_collect_entities(items)
+
+    title = (request.args.get("title") or "").strip().casefold()
+    actor_id = (request.args.get("actor") or "").strip()
+    studio_id = (request.args.get("studio") or "").strip()
+    included_categories = _csv_ids(request.args.get("included-categories") or "")
+    excluded_categories = _csv_ids(request.args.get("excluded-categories") or "")
+    included_statuses = _csv_ids(request.args.get("included-statuses") or "")
+
+    actor_name = maps["actors"].get(actor_id) if actor_id else None
+    studio_name = maps["studios"].get(studio_id) if studio_id else None
+    included_names = [maps["categories"].get(cid) for cid in included_categories]
+    excluded_names = [maps["categories"].get(cid) for cid in excluded_categories]
+
+    if (actor_id and not actor_name) or (studio_id and not studio_name) or any(name is None for name in included_names):
+        return []
+    if included_statuses:
+        # Статусы как фильтр пока не публикуем (/video-statuses отдаёт []), поэтому
+        # запрос с явным included-statuses не должен случайно показать всё подряд.
+        return []
+
+    filtered = []
+    for item in items:
+        haystack = " ".join(
+            [item.get("title") or ""]
+            + item.get("tags", [])
+            + item.get("studio", [])
+            + item.get("performers", [])
+        ).casefold()
+        if title and title not in haystack:
+            continue
+        if actor_name and actor_name not in item.get("performers", []):
+            continue
+        if studio_name and studio_name not in item.get("studio", []):
+            continue
+        item_tags = set(item.get("tags", []))
+        if any(name not in item_tags for name in included_names if name):
+            continue
+        if any(name in item_tags for name in excluded_names if name):
+            continue
+        filtered.append(item)
+
+    order = (request.args.get("order") or "").strip().casefold()
+    direction = (request.args.get("direction") or "asc").strip().casefold()
+    reverse = direction == "desc"
+    if order == "title":
+        filtered.sort(key=lambda x: (x.get("title") or "").casefold(), reverse=reverse)
+    elif order == "release_date":
+        filtered.sort(key=lambda x: int(x.get("updated_at") or 0), reverse=reverse)
+    elif order == "popularity":
+        filtered.sort(key=lambda x: int(x.get("seeders") or 0), reverse=reverse)
+    return filtered
+
+
+def _playa_entity_entries(kind: str, items: list, field: str, base_url: str) -> list:
+    by_title = {}
+    for item in items:
+        for title in item.get(field, []):
+            if not title:
+                continue
+            entry = by_title.setdefault(
+                title,
+                {
+                    "id": _playa_entity_id(kind, title),
+                    "title": title,
+                    "preview": _image_url(item, base_url),
+                    "count": 0,
+                    "studios": set(),
+                },
+            )
+            entry["count"] += 1
+            entry["studios"].update(item.get("studio", []))
+    entries = list(by_title.values())
+    title_filter = (request.args.get("title") or "").strip().casefold()
+    if title_filter:
+        entries = [entry for entry in entries if title_filter in entry["title"].casefold()]
+    order = (request.args.get("order") or "title").strip().casefold()
+    direction = (request.args.get("direction") or "asc").strip().casefold()
+    reverse = direction == "desc"
+    if order == "popularity":
+        entries.sort(key=lambda x: (x["count"], x["title"].casefold()), reverse=reverse)
+    else:
+        entries.sort(key=lambda x: x["title"].casefold(), reverse=reverse)
+    return entries
+
+
+def _playa_category_entries(items: list, base_url: str) -> list:
+    by_title = {}
+    for item in items:
+        for title in item.get("tags", []):
+            if not title:
+                continue
+            by_title.setdefault(
+                title,
+                {
+                    "id": _playa_entity_id("category", title),
+                    "title": title,
+                    "preview": _image_url(item, base_url),
+                },
+            )
+    return sorted(by_title.values(), key=lambda x: x["title"].casefold())
+
+
+@app.get(f"{_PLAYA_PREFIX}/version")
+def playa_version():
+    return _playa_response("1.10.1")
+
+
+@app.get(f"{_PLAYA_PREFIX}/config")
+def playa_config():
+    return _playa_response({
+        "site_name": "deovr-bridge",
+        "site_logo": _placeholder_url(_base_url()),
+        "auth": False,
+        "auth_by_code": False,
+        "actors": True,
+        "categories": True,
+        "categories_groups": True,
+        "studios": True,
+        "scripts": False,
+        "masks": False,
+        "analytics": False,
+        "nsfw": True,
+        "ar": False,
+    })
+
+
+@app.get(f"{_PLAYA_PREFIX}/videos")
+def playa_videos():
+    base_url = _base_url()
+    items = _playa_filter_videos(_library_items())
+    page_index, page_size = _playa_page_args()
+    content = [_playa_list_view(item, base_url) for item in items]
+    return _playa_response(_playa_page(content, page_index, page_size))
+
+
+@app.get(f"{_PLAYA_PREFIX}/video/<item_id>")
+def playa_video_detail(item_id):
+    item = _get_library_item(item_id)
+    if not item:
+        return _playa_not_found("Video not found")
+    return _playa_response(_playa_video_view(item, _base_url()))
+
+
+@app.get(f"{_PLAYA_PREFIX}/actors")
+def playa_actors():
+    base_url = _base_url()
+    entries = _playa_entity_entries("actor", _library_items(), "performers", base_url)
+    page_index, page_size = _playa_page_args()
+    content = [{"id": e["id"], "title": e["title"], "preview": e["preview"]} for e in entries]
+    return _playa_response(_playa_page(content, page_index, page_size))
+
+
+@app.get(f"{_PLAYA_PREFIX}/actor/<actor_id>")
+def playa_actor_detail(actor_id):
+    base_url = _base_url()
+    entries = _playa_entity_entries("actor", _library_items(), "performers", base_url)
+    entry = next((e for e in entries if e["id"] == actor_id), None)
+    if not entry:
+        return _playa_not_found("Actor not found")
+    return _playa_response({
+        "id": entry["id"],
+        "title": entry["title"],
+        "preview": entry["preview"],
+        "studios": [
+            {"id": _playa_entity_id("studio", title), "title": title}
+            for title in sorted(entry["studios"], key=str.casefold)
+        ],
+        "aliases": [],
+        "views": int(entry["count"]),
+    })
+
+
+@app.get(f"{_PLAYA_PREFIX}/studios")
+def playa_studios():
+    base_url = _base_url()
+    entries = _playa_entity_entries("studio", _library_items(), "studio", base_url)
+    page_index, page_size = _playa_page_args()
+    content = [{"id": e["id"], "title": e["title"], "preview": e["preview"]} for e in entries]
+    return _playa_response(_playa_page(content, page_index, page_size))
+
+
+@app.get(f"{_PLAYA_PREFIX}/studio/<studio_id>")
+def playa_studio_detail(studio_id):
+    base_url = _base_url()
+    entries = _playa_entity_entries("studio", _library_items(), "studio", base_url)
+    entry = next((e for e in entries if e["id"] == studio_id), None)
+    if not entry:
+        return _playa_not_found("Studio not found")
+    return _playa_response({
+        "id": entry["id"],
+        "title": entry["title"],
+        "preview": entry["preview"],
+        "description": f"{entry['count']} video(s) in local deovr-bridge library.",
+        "views": int(entry["count"]),
+    })
+
+
+@app.get(f"{_PLAYA_PREFIX}/categories")
+@app.get(f"{_PLAYA_PREFIX}/categories;")
+def playa_categories():
+    return _playa_response(_playa_category_entries(_library_items(), _base_url()))
+
+
+@app.get(f"{_PLAYA_PREFIX}/categories-groups")
+@app.get(f"{_PLAYA_PREFIX}/categories-groups;")
+def playa_categories_groups():
+    categories = _playa_category_entries(_library_items(), _base_url())
+    return _playa_response([{"id": "tags", "title": "Tags", "items": categories}])
+
+
+@app.get(f"{_PLAYA_PREFIX}/video-statuses")
+@app.get(f"{_PLAYA_PREFIX}/video-statuses;")
+def playa_video_statuses():
+    return _playa_response([])
+
+
+@app.route(f"{_PLAYA_PREFIX}/event", methods=["PUT", "POST"])
+def playa_event():
+    # Пока статистику не ведём: PLAY'A получает валидный ответ, а мы ничего не пишем.
+    return _playa_response()
+
+
 @app.get("/thumb/<item_id>")
 def thumb_proxy(item_id):
-    item = store.get_item(item_id)
+    item = _get_library_item(item_id)
     if not item or not item["thumbnail_url"]:
         return "", 404
     site_id = item.get("site") or "pornolab"

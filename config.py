@@ -157,6 +157,16 @@ MAX_TAG_SCENES = int(os.environ.get("MAX_TAG_SCENES", "15"))
 # более старые карточки сместятся).
 MAX_SCENE_ITEMS = int(os.environ.get("MAX_SCENE_ITEMS", "400"))
 
+# Источники, которые уже можно продолжать скрапить/держать в БД, но временно НЕ
+# показывать в пользовательских библиотеках (/deovr, /heresphere, PLAYA API).
+# Сейчас xxxclub скрыт по просьбе пользователя: вернём выдачу карточек позже,
+# когда отдельно проверим качество метаданных и поведение плееров.
+HIDDEN_LIBRARY_SITE_IDS = {
+    part.strip()
+    for part in os.environ.get("HIDDEN_LIBRARY_SITE_IDS", "xxxclub").split(",")
+    if part.strip()
+}
+
 REFRESH_INTERVAL_SEC = int(os.environ.get("REFRESH_INTERVAL_SEC", "3600"))
 
 # Сколько секунд переиспользовать уже полученный у TorrServe stream_url, не
