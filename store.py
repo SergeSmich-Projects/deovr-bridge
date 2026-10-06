@@ -144,20 +144,6 @@ def init_db():
             """
         )
 
-        # Локальное избранное. PLAY'A API v2 не документирует write-favorites,
-        # поэтому храним избранные ролики/актёров/студии у себя и экспонируем их
-        # как статусы/псевдо-категории + простые локальные HTTP endpoints.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS favorites (
-                kind TEXT NOT NULL,          -- video | actor | studio
-                entity_id TEXT NOT NULL,
-                created_at INTEGER,
-                PRIMARY KEY (kind, entity_id)
-            )
-            """
-        )
-
         _db_initialized = True
         _db_initialized_path = config.DB_PATH
 
@@ -379,51 +365,6 @@ def upsert_entity_meta(kind: str, entity_id: str, title: str, preview_url: str =
              trailer_url or "", description or "", int(time.time())),
         )
 
-
-def set_favorite(kind: str, entity_id: str, enabled: bool = True):
-    ensure_db()
-    with _lock, _conn() as conn:
-        if enabled:
-            conn.execute(
-                """
-                INSERT INTO favorites (kind, entity_id, created_at) VALUES (?, ?, ?)
-                ON CONFLICT(kind, entity_id) DO UPDATE SET created_at=excluded.created_at
-                """,
-                (kind, entity_id, int(time.time())),
-            )
-        else:
-            conn.execute("DELETE FROM favorites WHERE kind = ? AND entity_id = ?", (kind, entity_id))
-
-
-def toggle_favorite(kind: str, entity_id: str) -> bool:
-    enabled = not is_favorite(kind, entity_id)
-    set_favorite(kind, entity_id, enabled)
-    return enabled
-
-
-def is_favorite(kind: str, entity_id: str) -> bool:
-    ensure_db()
-    with _lock, _conn() as conn:
-        r = conn.execute(
-            "SELECT 1 FROM favorites WHERE kind = ? AND entity_id = ?",
-            (kind, entity_id),
-        ).fetchone()
-        return r is not None
-
-
-def favorite_ids(kind: str) -> set:
-    ensure_db()
-    with _lock, _conn() as conn:
-        rows = conn.execute("SELECT entity_id FROM favorites WHERE kind = ?", (kind,)).fetchall()
-        return {r["entity_id"] for r in rows}
-
-
-def all_favorites() -> list:
-    ensure_db()
-    with _lock, _conn() as conn:
-        return [dict(r) for r in conn.execute(
-            "SELECT kind, entity_id, created_at FROM favorites ORDER BY created_at DESC"
-        ).fetchall()]
 
 
 def get_crawl_state(section_url: str) -> dict:

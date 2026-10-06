@@ -129,12 +129,12 @@ HIDDEN_LIBRARY_SITE_IDS=xxxclub
 HIDDEN_LIBRARY_SITE_IDS=
 ```
 
-### PLAY'A: постеры актёров, логотипы студий и избранное
+### PLAY'A: постеры актёров и логотипы студий
 
-Для страниц Actors/Studios мост лениво пробует подтягивать публичные картинки с POVR:
+Для страниц Actors/Studios мост лениво пробует подтягивать публичные картинки:
 
-- актёры: `https://povr.com/pornstars/<actor-slug>` → headshot/poster;
-- студии: `https://povr.com/studios/<studio-slug>` → logo;
+- актёры: сначала `https://www.vrspy.com/star/<actor-slug>` → avatar/poster, затем fallback `https://povr.com/pornstars/<actor-slug>`;
+- студии: `https://povr.com/studios/<studio-slug>` → logo, SVG автоматически заменяется на PNG `t760povr.png`, если такой URL можно построить;
 - если на странице удаётся найти трейлер одного из роликов, его URL сохраняется как служебная ссылка в debug/metadata.
 
 Кэшируются только URL и текстовые метаданные в `cache.sqlite3`, сами изображения/видео не скачиваются.
@@ -144,30 +144,13 @@ HIDDEN_LIBRARY_SITE_IDS=
 ENABLE_EXTERNAL_ENTITY_META=0
 ```
 
-Локальное избранное хранится в таблице `favorites` и управляется простыми endpoints:
+Правая панель PLAY'A сейчас отдаёт только группу `Tags` с обычными категориями/тегами. Избранное не
+дублируется на стороне моста: используем нативное избранное PLAY'A.
 
-```text
-GET    /favorites
-POST   /favorites/video/<id>
-DELETE /favorites/video/<id>
-POST   /favorites/actor/<actor_id>
-DELETE /favorites/actor/<actor_id>
-POST   /favorites/studio/<studio_id>
-DELETE /favorites/studio/<studio_id>
-GET    /favorite/<video|actor|studio>/<id>/toggle
-```
-
-В PLAY'A избранные видео доступны как video status `favorite`, а в Categories Groups есть группа
-`Favorites` с псевдо-категориями:
-
-```text
-★ Favorite videos
-★ Videos with favorite actors
-★ Videos from favorite studios
-```
-
-Карточки PLAY'A теперь отдают subtitle в две строки: первая — студия и актёры, вторая — сиды/пиры,
-разрешение и дата добавления. Бейдж `status` используется только для `★ Favorite`.
+Карточки PLAY'A: крупная строка — студия, мелкая строка — актёры. Сиды/пиры, разрешение и короткая
+дата (`06.10.26`) убраны из видимого текста карточки и отдаются только как вспомогательные `tooltip` /
+`description` поля для клиентов, которые умеют показывать их при наведении. HTML/CSS в PLAY'A API не
+поддерживается, поэтому цветовой акцент сидов/пиров сделан unicode-индикаторами (`🟢S7 🔴P2`).
 
 ## Что ещё можно настроить
 

@@ -209,10 +209,12 @@ class DeoVRContractTests(unittest.TestCase):
         self.assertEqual(videos["data"]["item_total"], 1)
         card = videos["data"]["content"][0]
         self.assertEqual(card["status"], "")
-        self.assertIn("Studio A", card["subtitle"])
+        self.assertIn("Studio A", card["title"])
         self.assertIn("Actor One", card["subtitle"])
-        self.assertIn("S:7 P:2", card["subtitle"])
-        self.assertIn("3072p", card["subtitle"])
+        self.assertNotIn("S7", card["subtitle"])
+        self.assertIn("S7", card["tooltip"])
+        self.assertIn("P2", card["tooltip"])
+        self.assertIn("3072p", card["tooltip"])
 
         detail = client.get("/api/playa/v2/video/pl_42", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertEqual(detail["status"]["code"], 1)
@@ -244,42 +246,10 @@ class DeoVRContractTests(unittest.TestCase):
         self.assertEqual(categories["status"]["code"], 1)
         self.assertTrue(any(category["title"] == "VR" for category in categories["data"]))
 
-    def test_playa_favorites_are_exposed_as_statuses_and_pseudo_categories(self):
-        db_path = _temp_db(self)
-        app_mod, store_mod = _load_app_for_db(db_path)
-        store_mod.upsert_item(_sample_item(id="fav_video", title="Favorite video"))
-        store_mod.upsert_item(_sample_item(id="other_video", title="Other video", performers=["Other Actor"], studio=["Other Studio"]))
-
-        actor_id = app_mod._playa_entity_id("actor", "Actor One")
-        studio_id = app_mod._playa_entity_id("studio", "Studio A")
-        store_mod.set_favorite("video", "fav_video", True)
-        store_mod.set_favorite("actor", actor_id, True)
-        store_mod.set_favorite("studio", studio_id, True)
-
-        client = app_mod.app.test_client()
-        videos = client.get(
-            "/api/playa/v2/videos?included-statuses=favorite",
-            headers={"Host": "192.168.1.2:9999"},
-        ).get_json()
-        self.assertEqual(videos["data"]["item_total"], 1)
-        self.assertEqual(videos["data"]["content"][0]["id"], "fav_video")
-        self.assertEqual(videos["data"]["content"][0]["status"], "★ Favorite")
-
-        by_actor = client.get(
-            f"/api/playa/v2/videos?included-categories={app_mod._PLAYA_FAV_ACTOR_CATEGORY_ID}",
-            headers={"Host": "192.168.1.2:9999"},
-        ).get_json()
-        self.assertEqual(by_actor["data"]["item_total"], 1)
-        self.assertEqual(by_actor["data"]["content"][0]["id"], "fav_video")
-
-        actor_detail = client.get(f"/api/playa/v2/actor/{actor_id}", headers={"Host": "192.168.1.2:9999"}).get_json()
-        self.assertEqual(actor_detail["data"]["title"], "★ Actor One")
-        props = {p["name"]: p["value"] for p in actor_detail["data"]["properties"]}
-        self.assertEqual(props["Favorite"], "yes")
-        self.assertEqual(props["Favorite videos"], "1")
-
+        groups = client.get("/api/playa/v2/categories-groups", headers={"Host": "192.168.1.2:9999"}).get_json()
+        self.assertEqual([g["id"] for g in groups["data"]], ["tags"])
         statuses = client.get("/api/playa/v2/video-statuses", headers={"Host": "192.168.1.2:9999"}).get_json()
-        self.assertTrue(any(s["id"] == "favorite" for s in statuses["data"]))
+        self.assertEqual(statuses["data"], [])
 
 
 if __name__ == "__main__":
