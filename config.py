@@ -9,6 +9,30 @@
 
 import os
 
+
+def _load_local_env():
+    """Минимальная загрузка .env без внешних зависимостей.
+
+    Файл .env уже в .gitignore; удобно хранить там локальные API keys вроде
+    ThePornDB/StashBox, не экспортируя переменные каждый запуск.
+    """
+    path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_local_env()
+
 # ---------------------------------------------------------------------------
 # ФОРУМ
 # ---------------------------------------------------------------------------

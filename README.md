@@ -138,7 +138,7 @@ HIDDEN_LIBRARY_SITE_IDS=
 - студии: публичный fallback сначала ищет точное совпадение в `https://povr.com/studios` → PNG logo, затем detail `https://povr.com/studios/<studio-slug>` только если страница точно совпала со студией; старый кэш студий автоматически пересобирается, чтобы убрать ошибочно подобранные чужие логотипы;
 - если на странице удаётся найти трейлер одного из роликов, его URL сохраняется только как служебная ссылка в debug/metadata.
 
-Stash-Box provider включается так (ключи хранить только локально, не коммитить):
+Stash-Box provider включается через переменную окружения или локальный `.env` файл (он в `.gitignore`, ключи не коммитить):
 
 ```bash
 STASHBOX_METADATA_PROVIDERS="https://theporndb.net/graphql|TPDB_API_KEY;https://stashdb.org/graphql|STASHDB_API_KEY"
