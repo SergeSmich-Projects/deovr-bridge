@@ -251,6 +251,42 @@ class DeoVRContractTests(unittest.TestCase):
         statuses = client.get("/api/playa/v2/video-statuses", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertEqual(statuses["data"], [])
 
+    def test_playa_ignores_stale_entity_meta_cache(self):
+        db_path = _temp_db(self)
+        app_mod, store_mod = _load_app_for_db(db_path)
+        store_mod.upsert_item(_sample_item(id="meta_1", title="Metadata sample"))
+
+        actor_id = app_mod._playa_entity_id("actor", "Actor One")
+        studio_id = app_mod._playa_entity_id("studio", "Studio A")
+        store_mod.upsert_entity_meta(
+            "actor",
+            actor_id,
+            "Actor One",
+            preview_url="https://images.povr.com/headshots/same-for-everyone/crop/300.jpg",
+            source_url="https://povr.com/pornstars/actor-one",
+            trailer_url="https://example.invalid/trailer.mp4",
+        )
+        store_mod.upsert_entity_meta(
+            "studio",
+            studio_id,
+            "Studio A",
+            preview_url="https://images.povr.com/assets/logos/channels/0/2/2627/t760povr.png",
+            source_url="https://povr.com/studios/studio-a",
+        )
+
+        client = app_mod.app.test_client()
+        actors = client.get("/api/playa/v2/actors", headers={"Host": "192.168.1.2:9999"}).get_json()
+        self.assertIn("/entity-placeholder/actor/", actors["data"]["content"][0]["preview"])
+        self.assertNotIn("images.povr.com", actors["data"]["content"][0]["preview"])
+
+        actor_detail = client.get(f"/api/playa/v2/actor/{actor_id}", headers={"Host": "192.168.1.2:9999"}).get_json()
+        prop_names = [prop["name"] for prop in actor_detail["data"]["properties"]]
+        self.assertEqual(prop_names, ["Videos"])
+
+        studios = client.get("/api/playa/v2/studios", headers={"Host": "192.168.1.2:9999"}).get_json()
+        self.assertIn("/entity-placeholder/studio/", studios["data"]["content"][0]["preview"])
+        self.assertNotIn("images.povr.com", studios["data"]["content"][0]["preview"])
+
 
 if __name__ == "__main__":
     unittest.main()

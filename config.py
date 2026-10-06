@@ -168,9 +168,9 @@ HIDDEN_LIBRARY_SITE_IDS = {
 }
 
 # Внешние постеры актёров/логотипы студий для PLAY'A. По умолчанию пробуем
-# лениво подтягивать публичные изображения с VRSpy (актёры) и POVR (fallback/
-# студии) и кэшировать только URL в БД. Если внешние сайты недоступны или
-# хочется полностью офлайн-режим - поставьте 0.
+# лениво подтягивать публичные изображения с VRSpy (актёры) и POVR (студии)
+# и кэшировать только URL в БД. Если внешние сайты недоступны или хочется
+# полностью офлайн-режим - поставьте 0.
 ENABLE_EXTERNAL_ENTITY_META = os.environ.get("ENABLE_EXTERNAL_ENTITY_META", "1").lower() not in ("0", "false", "no")
 EXTERNAL_ENTITY_META_TTL_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TTL_SEC", str(30 * 24 * 3600)))
 EXTERNAL_ENTITY_META_TIMEOUT_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TIMEOUT_SEC", "8"))
