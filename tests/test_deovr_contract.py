@@ -351,13 +351,16 @@ class DeoVRContractTests(unittest.TestCase):
             raise AssertionError(url)
 
         app_mod._external_get_json = fake_get_json
+        app_mod._ENTITY_DIRECTORY_CACHE.clear()
         actor = app_mod._fetch_vrporn_playa_entity_meta("actor", "Blake Blossom")
-        self.assertEqual(actor["preview_url"], "https://cdn.vrporn.com/models/blake-blossom/detail.jpg")
+        self.assertEqual(actor["preview_url"], "https://cdn.vrporn.com/models/blake-blossom/profile.jpg")
         self.assertIn("/api/playa/v2/actor/blake-blossom", actor["source_url"])
         studio = app_mod._fetch_vrporn_playa_entity_meta("studio", "VR Bangers")
-        self.assertEqual(studio["preview_url"], "https://cdn.vrporn.com/studios/vrbangers/detail-logo.jpg")
-        self.assertEqual(studio["description"], "Studio description")
+        self.assertEqual(studio["preview_url"], "https://cdn.vrporn.com/studios/vrbangers/logo.jpg")
+        self.assertEqual(studio["description"], "")
         self.assertTrue(any("title=Blake+Blossom" in url for url in calls))
+        self.assertTrue(any("/api/playa/v2/studios?page-size=1000" in url for url in calls))
+        self.assertFalse(any("/api/playa/v2/studio/vrbangers" in url for url in calls))
 
 
 if __name__ == "__main__":

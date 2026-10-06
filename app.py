@@ -1141,50 +1141,87 @@ def _best_playa_list_match(content: list, title: str) -> dict:
     return content[0] if content else {}
 
 
-def _fetch_vrporn_playa_entity_meta(kind: str, title: str) -> dict:
-    """Берём artwork напрямую из PLAY'A API VRPorn.com.
+def _playa_payload_ok(payload: dict) -> bool:
+    return int(((payload.get("status") or {}).get("code") or 0)) == 1
 
-    Это ровно тот источник/формат, который сам PLAY'A уже умеет показывать:
-    /api/playa/v2/actors и /studios отдают preview URL для карточек, detail —
-    тот же preview плюс описание/свойства. Никакого HTML-скрейпинга и guessing.
-    """
-    if kind == "actor":
-        collection = "actors"
-        detail_prefix = "actor"
-    elif kind == "studio":
-        collection = "studios"
-        detail_prefix = "studio"
-    else:
+
+def _playa_page_content(payload: dict) -> list:
+    if not _playa_payload_ok(payload):
+        return []
+    data = payload.get("data") or {}
+    if isinstance(data, dict):
+        content = data.get("content") or []
+        return content if isinstance(content, list) else []
+    return []
+
+
+def _vrporn_entity_meta_from_entry(kind: str, entry: dict, detail: dict = None) -> dict:
+    detail = detail or {}
+    entity_id = entry.get("id") or _slugify_povr(entry.get("title") or "")
+    if not entity_id:
         return {}
-    base_url = config.VRPORN_BASE_URL.rstrip("/")
-    search_url = _playa_api_url(base_url, f"/api/playa/v2/{collection}", {"title": title, "page-size": 8})
-    payload = _external_get_json(search_url)
-    if int(((payload.get("status") or {}).get("code") or 0)) != 1:
-        return {}
-    page = payload.get("data") or {}
-    entry = _best_playa_list_match(page.get("content") or [], title)
-    if not entry:
-        return {}
-    entity_id = entry.get("id") or _slugify_povr(title)
-    detail_url = _playa_api_url(base_url, f"/api/playa/v2/{detail_prefix}/{urllib.parse.quote(entity_id, safe='')}")
-    detail = {}
-    try:
-        detail_payload = _external_get_json(detail_url)
-        if int(((detail_payload.get("status") or {}).get("code") or 0)) == 1:
-            detail = detail_payload.get("data") or {}
-    except Exception as e:
-        log.debug("VRPorn detail %s %r недоступен: %s", kind, title, e)
+    detail_prefix = "actor" if kind == "actor" else "studio"
+    detail_url = _playa_api_url(
+        config.VRPORN_BASE_URL.rstrip("/"),
+        f"/api/playa/v2/{detail_prefix}/{urllib.parse.quote(entity_id, safe='')}",
+    )
     preview_url = _normalize_external_image_url(detail.get("preview") or entry.get("preview") or "")
     if not preview_url:
         return {}
-    description = detail.get("description") or ""
     return {
         "preview_url": preview_url,
         "banner_url": _normalize_external_image_url(detail.get("banner") or ""),
         "source_url": detail_url,
         "trailer_url": "",
-        "description": description,
+        "description": detail.get("description") or "",
     }
+
+
+def _fetch_vrporn_playa_studio_directory_map() -> dict:
+    key = "vrporn-playa-studios"
+    cached = _cached_directory_map(key)
+    if cached is not None:
+        return cached
+    base_url = config.VRPORN_BASE_URL.rstrip("/")
+    url = _playa_api_url(base_url, "/api/playa/v2/studios", {"page-size": 1000})
+    content = _playa_page_content(_external_get_json(url))
+    result = {}
+    for entry in content:
+        meta = _vrporn_entity_meta_from_entry("studio", entry)
+        if not meta:
+            continue
+        title_slug = _slugify_povr(entry.get("title") or "")
+        id_slug = _slugify_povr(entry.get("id") or "")
+        compact_title = _compact_slug(title_slug)
+        compact_id = _compact_slug(id_slug)
+        for key_slug in {title_slug, id_slug, compact_title, compact_id}:
+            if key_slug:
+                result[key_slug] = meta
+    return _set_directory_map(key, result)
+
+
+
+def _fetch_vrporn_playa_entity_meta(kind: str, title: str) -> dict:
+    """Берём artwork напрямую из PLAY'A API VRPorn.com.
+
+    Это ровно тот источник/формат, который сам PLAY'A уже умеет показывать.
+    Студии забираем пачкой из `/studios` (там всего ~400 записей), поэтому лого
+    находятся одним запросом. Актёров ищем точечно через `title`, без detail-запроса:
+    list view уже содержит `preview`, а второй запрос сильно замедлял прогрузку.
+    """
+    if kind == "studio":
+        slug = _slugify_povr(title)
+        directory = _fetch_vrporn_playa_studio_directory_map()
+        return directory.get(slug) or directory.get(_compact_slug(slug)) or {}
+    if kind != "actor":
+        return {}
+
+    base_url = config.VRPORN_BASE_URL.rstrip("/")
+    search_url = _playa_api_url(base_url, "/api/playa/v2/actors", {"title": title, "page-size": 8})
+    entry = _best_playa_list_match(_playa_page_content(_external_get_json(search_url)), title)
+    if not entry:
+        return {}
+    return _vrporn_entity_meta_from_entry("actor", entry)
 
 
 
