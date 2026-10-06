@@ -1966,7 +1966,8 @@ def _playa_schedule_entity_meta_refresh(kind: str, entries: list, force: bool = 
         return
     titles = []
     seen = set()
-    for entry in entries[:60]:
+    limit = len(entries) if force else 60
+    for entry in entries[:limit]:
         title = entry.get("title") or ""
         if not title or title in seen:
             continue
