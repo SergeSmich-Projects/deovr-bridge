@@ -129,6 +129,46 @@ HIDDEN_LIBRARY_SITE_IDS=xxxclub
 HIDDEN_LIBRARY_SITE_IDS=
 ```
 
+### PLAY'A: постеры актёров, логотипы студий и избранное
+
+Для страниц Actors/Studios мост лениво пробует подтягивать публичные картинки с POVR:
+
+- актёры: `https://povr.com/pornstars/<actor-slug>` → headshot/poster;
+- студии: `https://povr.com/studios/<studio-slug>` → logo;
+- если на странице удаётся найти трейлер одного из роликов, его URL сохраняется как служебная ссылка в debug/metadata.
+
+Кэшируются только URL и текстовые метаданные в `cache.sqlite3`, сами изображения/видео не скачиваются.
+Отключить внешний lookup можно так:
+
+```bash
+ENABLE_EXTERNAL_ENTITY_META=0
+```
+
+Локальное избранное хранится в таблице `favorites` и управляется простыми endpoints:
+
+```text
+GET    /favorites
+POST   /favorites/video/<id>
+DELETE /favorites/video/<id>
+POST   /favorites/actor/<actor_id>
+DELETE /favorites/actor/<actor_id>
+POST   /favorites/studio/<studio_id>
+DELETE /favorites/studio/<studio_id>
+GET    /favorite/<video|actor|studio>/<id>/toggle
+```
+
+В PLAY'A избранные видео доступны как video status `favorite`, а в Categories Groups есть группа
+`Favorites` с псевдо-категориями:
+
+```text
+★ Favorite videos
+★ Videos with favorite actors
+★ Videos from favorite studios
+```
+
+Карточки PLAY'A теперь отдают subtitle в две строки: первая — студия и актёры, вторая — сиды/пиры,
+разрешение и дата добавления. Бейдж `status` используется только для `★ Favorite`.
+
 ## Что ещё можно настроить
 
 - **`config.FORUM_MAX_PAGES`** — сколько страниц раздела (по 50 тем) парсить за раз. На старте

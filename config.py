@@ -167,6 +167,14 @@ HIDDEN_LIBRARY_SITE_IDS = {
     if part.strip()
 }
 
+# Внешние постеры актёров/логотипы студий для PLAY'A. По умолчанию пробуем
+# лениво подтягивать публичные изображения с POVR и кэшировать только URL в БД.
+# Если сайт недоступен или хочется полностью офлайн-режим - поставьте 0.
+ENABLE_EXTERNAL_ENTITY_META = os.environ.get("ENABLE_EXTERNAL_ENTITY_META", "1").lower() not in ("0", "false", "no")
+EXTERNAL_ENTITY_META_TTL_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TTL_SEC", str(30 * 24 * 3600)))
+EXTERNAL_ENTITY_META_TIMEOUT_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TIMEOUT_SEC", "8"))
+POVR_BASE_URL = os.environ.get("POVR_BASE_URL", "https://povr.com")
+
 REFRESH_INTERVAL_SEC = int(os.environ.get("REFRESH_INTERVAL_SEC", "3600"))
 
 # Сколько секунд переиспользовать уже полученный у TorrServe stream_url, не

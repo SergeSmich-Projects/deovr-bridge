@@ -22,8 +22,10 @@ import base64
 import hashlib
 import logging
 import math
+import re
 import threading
 import time
+import unicodedata
 import urllib.parse
 import zlib
 
@@ -713,6 +715,9 @@ _PLAYA_STEREO = {
     "mono": "MN",
     "mn": "MN",
 }
+_PLAYA_FAV_VIDEO_CATEGORY_ID = "__favorites_videos__"
+_PLAYA_FAV_ACTOR_CATEGORY_ID = "__favorites_actors__"
+_PLAYA_FAV_STUDIO_CATEGORY_ID = "__favorites_studios__"
 
 
 def _playa_response(data=None, code: int = 1, message: str = None):
@@ -748,27 +753,217 @@ def _playa_entity_id(kind: str, title: str) -> str:
     return f"{kind}_{digest}"
 
 
-def _playa_status(item: dict) -> str:
+def _slugify_povr(title: str) -> str:
+    """Best-effort slug для публичных страниц POVR: Mia Malkova -> mia-malkova."""
+    text = unicodedata.normalize("NFKD", title or "").encode("ascii", "ignore").decode("ascii")
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
+    return text
+
+
+def _external_get(url: str) -> str:
+    """GET для внешних метаданных с браузерным отпечатком, если доступен curl_cffi."""
+    timeout = config.EXTERNAL_ENTITY_META_TIMEOUT_SEC
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        from curl_cffi import requests as curl_requests
+        resp = curl_requests.get(url, headers=headers, timeout=timeout, impersonate="chrome124")
+    except Exception:
+        import requests
+        resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    encoding = getattr(resp, "encoding", None) or "utf-8"
+    content = getattr(resp, "content", None)
+    if content is not None:
+        return content.decode(encoding, errors="ignore")
+    return resp.text
+
+
+def _first_abs_url(base_url: str, value: str) -> str:
+    if not value:
+        return ""
+    return urllib.parse.urljoin(base_url, value)
+
+
+def _extract_povr_video_trailer(video_url: str) -> str:
+    """Пробует достать прямой mp4 трейлера со страницы видео POVR.
+
+    На страницах роликов POVR публично видны ссылки вида
+    /download/<id>/trailer/ovr1920stream.mp4. В PLAY'A ActorView/StudioView
+    отдельного поля trailer нет, поэтому сейчас используем это только как
+    диагностическую/служебную ссылку в entity_meta и debug/favorites API.
+    """
+    try:
+        html = _external_get(video_url)
+    except Exception as e:
+        log.info("Не удалось получить POVR video trailer %s: %s", video_url, e)
+        return ""
+    links = re.findall(r"href=[\"']([^\"']*/download/\d+/trailer/[^\"']+\.mp4)[\"']", html, re.I)
+    if not links:
+        links = re.findall(r"https?://[^\"'<> ]+/download/\d+/trailer/[^\"'<> ]+\.mp4", html, re.I)
+    if not links:
+        return ""
+    # Для предпросмотра не нужен 6K гигабайтный трейлер: выбираем умеренное качество,
+    # если оно есть, иначе первый попавшийся вариант.
+    preferred = sorted(
+        (_first_abs_url(video_url, link) for link in links),
+        key=lambda u: ("1080" not in u and "1920" not in u, "ovr6k" in u.lower(), u),
+    )
+    return preferred[0]
+
+
+def _fetch_povr_entity_meta(kind: str, title: str) -> dict:
+    slug = _slugify_povr(title)
+    if not slug:
+        return {}
+    if kind == "actor":
+        path = f"/pornstars/{slug}"
+        image_markers = ("/actors/", "/headshots/")
+    elif kind == "studio":
+        path = f"/studios/{slug}"
+        image_markers = ("/assets/logos/channels/",)
+    else:
+        return {}
+
+    source_url = urllib.parse.urljoin(config.POVR_BASE_URL.rstrip("/") + "/", path.lstrip("/"))
+    html = _external_get(source_url)
+
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        soup = None
+
+    preview_url = ""
+    description = ""
+    first_video_url = ""
+    banner_url = ""
+    if soup:
+        h1 = soup.find("h1")
+        # Если нас редиректнуло/отдало не ту страницу, не кэшируем чужую картинку.
+        if h1 and title and h1.get_text(" ", strip=True).casefold() != title.casefold():
+            if _slugify_povr(h1.get_text(" ", strip=True)) != slug:
+                return {}
+        for img in soup.find_all("img"):
+            src = img.get("src") or img.get("data-src") or img.get("data-original") or ""
+            if not src:
+                continue
+            src_abs = _first_abs_url(source_url, src)
+            src_low = src_abs.lower()
+            if any(marker in src_low for marker in image_markers):
+                preview_url = src_abs
+                break
+        if not preview_url and kind == "actor":
+            m = re.search(r"https?://[^\"'<> ]+/wvr/actors/[^\"'<> ]+\.(?:jpg|png|webp)", html, re.I)
+            preview_url = m.group(0) if m else ""
+        if not preview_url and kind == "studio":
+            m = re.search(r"https?://[^\"'<> ]+/assets/logos/channels/[^\"'<> ]+\.(?:svg|png|jpg|webp)", html, re.I)
+            preview_url = m.group(0) if m else ""
+        for p in soup.find_all("p"):
+            text = p.get_text(" ", strip=True)
+            if len(text) > 80:
+                description = text[:1200]
+                break
+        first_video = soup.find("a", href=re.compile(r"/vr-porn/"))
+        if first_video and first_video.get("href"):
+            first_video_url = _first_abs_url(source_url, first_video["href"])
+            img = first_video.find("img")
+            if img:
+                banner_url = _first_abs_url(source_url, img.get("src") or img.get("data-src") or "")
+    else:
+        m = re.search(r"https?://[^\"'<> ]+/(?:wvr/actors|headshots|assets/logos/channels)/[^\"'<> ]+\.(?:jpg|png|webp|svg)", html, re.I)
+        preview_url = m.group(0) if m else ""
+
+    trailer_url = _extract_povr_video_trailer(first_video_url) if first_video_url else ""
+    return {
+        "preview_url": preview_url,
+        "banner_url": banner_url,
+        "source_url": source_url,
+        "trailer_url": trailer_url,
+        "description": description,
+    }
+
+
+def _playa_entity_meta(kind: str, title: str) -> dict:
+    entity_id = _playa_entity_id(kind, title)
+    cached = store.get_entity_meta(kind, entity_id)
+    now = int(time.time())
+    if cached and (now - int(cached.get("updated_at") or 0)) < config.EXTERNAL_ENTITY_META_TTL_SEC:
+        return cached
+    if not config.ENABLE_EXTERNAL_ENTITY_META:
+        return cached or {}
+    try:
+        meta = _fetch_povr_entity_meta(kind, title)
+    except Exception as e:
+        log.info("Не удалось обновить внешние метаданные %s %r: %s", kind, title, e)
+        meta = {}
+    # Кэшируем и отрицательный результат, чтобы не стучаться во внешний сайт на
+    # каждый запрос PLAY'A, если артиста/студию там не нашли.
+    store.upsert_entity_meta(
+        kind,
+        entity_id,
+        title,
+        preview_url=meta.get("preview_url", ""),
+        banner_url=meta.get("banner_url", ""),
+        source_url=meta.get("source_url", ""),
+        trailer_url=meta.get("trailer_url", ""),
+        description=meta.get("description", ""),
+    )
+    return store.get_entity_meta(kind, entity_id) or {}
+
+
+def _playa_seed_peer_text(item: dict) -> str:
     seeders = item.get("seeders")
     leechers = item.get("leechers")
     if seeders is None and leechers is None:
-        return ""
+        return "S:? P:?"
     s = seeders if seeders is not None else "?"
-    l = leechers if leechers is not None else "?"
-    return f"S:{s} L:{l}"
+    p = leechers if leechers is not None else "?"
+    return f"S:{s} P:{p}"
 
 
-def _playa_subtitle(item: dict) -> str:
+def _playa_video_status_id(item: dict) -> str:
+    return "favorite" if store.is_favorite("video", str(item["id"])) else "normal"
+
+
+def _playa_status(item: dict) -> str:
+    # Поле status PLAY'A показывает бейдж рядом с названием. Сиды/пиры теперь
+    # уводим во вторую строку subtitle, а status оставляем под избранное.
+    return "★ Favorite" if _playa_video_status_id(item) == "favorite" else ""
+
+
+def _playa_people_line(item: dict) -> str:
     studios = [x for x in item.get("studio", []) if x]
     performers = [x for x in item.get("performers", []) if x]
     if studios and performers:
-        return f"{', '.join(studios[:2])} · {', '.join(performers[:2])}"
+        return f"{', '.join(studios[:2])} · {', '.join(performers[:3])}"
     if studios:
         return ", ".join(studios[:3])
     if performers:
         return ", ".join(performers[:3])
     site_id = item.get("site") or "pornolab"
     return _site_label(site_id) or site_id
+
+
+def _playa_added_date(item: dict) -> str:
+    ts = int(item.get("created_at") or item.get("updated_at") or 0)
+    if not ts:
+        return "date:?"
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _playa_info_line(item: dict) -> str:
+    return f"{_playa_seed_peer_text(item)} · {_playa_quality_name(item)} · {_playa_added_date(item)}"
+
+
+def _playa_subtitle(item: dict) -> str:
+    # PLAY'A отображает subtitle под названием карточки. Даём две строки:
+    # 1) студия + актёры, 2) сиды/пиры + разрешение + дата добавления.
+    return f"{_playa_people_line(item)}\n{_playa_info_line(item)}"
 
 
 def _playa_quality_name(item: dict) -> str:
@@ -814,7 +1009,7 @@ def _playa_list_view(item: dict, base_url: str) -> dict:
         "status": _playa_status(item),
         "preview_image": _image_url(item, base_url),
         "has_scripts": False,
-        "release_date": int(item.get("updated_at") or 0),
+        "release_date": int(item.get("created_at") or item.get("updated_at") or 0),
         "details": [
             {
                 "type": "full",
@@ -834,8 +1029,7 @@ def _playa_description(item: dict) -> str:
         lines.append("Actors: " + ", ".join(item["performers"]))
     if item.get("tags"):
         lines.append("Categories: " + ", ".join(item["tags"]))
-    if _playa_status(item):
-        lines.append("Peers: " + _playa_status(item))
+    lines.append("Peers: " + _playa_seed_peer_text(item))
     if item.get("video_height"):
         lines.append(f"Resolution: {item['video_height']}p")
     lines.append(f"Source: {item.get('site') or 'pornolab'} / {item.get('topic_id') or item.get('id')}")
@@ -859,7 +1053,7 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
         "status": _playa_status(item),
         "description": _playa_description(item),
         "preview_image": _image_url(item, base_url),
-        "release_date": int(item.get("updated_at") or 0),
+        "release_date": int(item.get("created_at") or item.get("updated_at") or 0),
         # В референсной реализации PLAY'A API v2 поле VideoView.studio - ОДИН
         # объект, не массив. Если отдать массив, карточка открывается, но клиент
         # может не распарсить detail-модель и не дойти до ссылки воспроизведения.
@@ -941,6 +1135,27 @@ def _playa_filter_videos(items: list) -> list:
     included_categories = _csv_ids(_playa_arg("included-categories") or "")
     excluded_categories = _csv_ids(_playa_arg("excluded-categories") or "")
     included_statuses = _csv_ids(_playa_arg("included-statuses") or "")
+    excluded_statuses = _csv_ids(_playa_arg("excluded-statuses") or "")
+
+    fav_video_ids = store.favorite_ids("video")
+    fav_actor_ids = store.favorite_ids("actor")
+    fav_studio_ids = store.favorite_ids("studio")
+
+    include_fav_videos = _PLAYA_FAV_VIDEO_CATEGORY_ID in included_categories
+    include_fav_actors = _PLAYA_FAV_ACTOR_CATEGORY_ID in included_categories
+    include_fav_studios = _PLAYA_FAV_STUDIO_CATEGORY_ID in included_categories
+    exclude_fav_videos = _PLAYA_FAV_VIDEO_CATEGORY_ID in excluded_categories
+    exclude_fav_actors = _PLAYA_FAV_ACTOR_CATEGORY_ID in excluded_categories
+    exclude_fav_studios = _PLAYA_FAV_STUDIO_CATEGORY_ID in excluded_categories
+
+    included_categories = [
+        cid for cid in included_categories
+        if cid not in {_PLAYA_FAV_VIDEO_CATEGORY_ID, _PLAYA_FAV_ACTOR_CATEGORY_ID, _PLAYA_FAV_STUDIO_CATEGORY_ID}
+    ]
+    excluded_categories = [
+        cid for cid in excluded_categories
+        if cid not in {_PLAYA_FAV_VIDEO_CATEGORY_ID, _PLAYA_FAV_ACTOR_CATEGORY_ID, _PLAYA_FAV_STUDIO_CATEGORY_ID}
+    ]
 
     actor_name = maps["actors"].get(actor_id) if actor_id else None
     studio_name = maps["studios"].get(studio_id) if studio_id else None
@@ -949,13 +1164,20 @@ def _playa_filter_videos(items: list) -> list:
 
     if (actor_id and not actor_name) or (studio_id and not studio_name) or any(name is None for name in included_names):
         return []
-    if included_statuses:
-        # Статусы как фильтр пока не публикуем (/video-statuses отдаёт []), поэтому
-        # запрос с явным included-statuses не должен случайно показать всё подряд.
-        return []
+
+    included_statuses = {s.casefold() for s in included_statuses}
+    excluded_statuses = {s.casefold() for s in excluded_statuses}
 
     filtered = []
     for item in items:
+        item_id = str(item["id"])
+        actor_ids = {_playa_entity_id("actor", title) for title in item.get("performers", [])}
+        studio_ids = {_playa_entity_id("studio", title) for title in item.get("studio", [])}
+        is_video_fav = item_id in fav_video_ids
+        has_fav_actor = bool(actor_ids & fav_actor_ids)
+        has_fav_studio = bool(studio_ids & fav_studio_ids)
+        status_id = "favorite" if is_video_fav else "normal"
+
         haystack = " ".join(
             [item.get("title") or ""]
             + item.get("tags", [])
@@ -973,6 +1195,24 @@ def _playa_filter_videos(items: list) -> list:
             continue
         if any(name in item_tags for name in excluded_names if name):
             continue
+
+        if include_fav_videos and not is_video_fav:
+            continue
+        if include_fav_actors and not has_fav_actor:
+            continue
+        if include_fav_studios and not has_fav_studio:
+            continue
+        if exclude_fav_videos and is_video_fav:
+            continue
+        if exclude_fav_actors and has_fav_actor:
+            continue
+        if exclude_fav_studios and has_fav_studio:
+            continue
+
+        if included_statuses and status_id not in included_statuses:
+            continue
+        if excluded_statuses and status_id in excluded_statuses:
+            continue
         filtered.append(item)
 
     order = (_playa_arg("order") or "").strip().casefold()
@@ -981,14 +1221,29 @@ def _playa_filter_videos(items: list) -> list:
     if order == "title":
         filtered.sort(key=lambda x: (x.get("title") or "").casefold(), reverse=reverse)
     elif order == "release_date":
-        filtered.sort(key=lambda x: int(x.get("updated_at") or 0), reverse=reverse)
+        filtered.sort(key=lambda x: int(x.get("created_at") or x.get("updated_at") or 0), reverse=reverse)
     elif order == "popularity":
         filtered.sort(key=lambda x: int(x.get("seeders") or 0), reverse=reverse)
     return filtered
 
+def _playa_enrich_entity_entry(kind: str, entry: dict) -> dict:
+    if entry.get("_enriched"):
+        return entry
+    meta = _playa_entity_meta(kind, entry["title"])
+    if meta.get("preview_url"):
+        entry["preview"] = meta["preview_url"]
+    entry["banner"] = meta.get("banner_url") or ""
+    entry["description"] = meta.get("description") or ""
+    entry["source_url"] = meta.get("source_url") or ""
+    entry["trailer_url"] = meta.get("trailer_url") or ""
+    entry["_enriched"] = True
+    return entry
 
-def _playa_entity_entries(kind: str, items: list, field: str, base_url: str) -> list:
+
+def _playa_entity_entries(kind: str, items: list, field: str, base_url: str, enrich: bool = False) -> list:
     by_title = {}
+    fav_ids = store.favorite_ids(kind)
+    fav_video_ids = store.favorite_ids("video")
     for item in items:
         for title in item.get(field, []):
             if not title:
@@ -999,13 +1254,24 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str) -> 
                     "id": _playa_entity_id(kind, title),
                     "title": title,
                     "preview": _image_url(item, base_url),
+                    "banner": "",
+                    "description": "",
+                    "source_url": "",
+                    "trailer_url": "",
                     "count": 0,
+                    "favorite_video_count": 0,
                     "studios": set(),
                 },
             )
             entry["count"] += 1
+            if str(item["id"]) in fav_video_ids:
+                entry["favorite_video_count"] += 1
             entry["studios"].update(item.get("studio", []))
+
     entries = list(by_title.values())
+    for entry in entries:
+        entry["is_favorite"] = entry["id"] in fav_ids
+
     title_filter = (_playa_arg("title") or "").strip().casefold()
     if title_filter:
         entries = [entry for entry in entries if title_filter in entry["title"].casefold()]
@@ -1016,10 +1282,14 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str) -> 
         entries.sort(key=lambda x: (x["count"], x["title"].casefold()), reverse=reverse)
     else:
         entries.sort(key=lambda x: x["title"].casefold(), reverse=reverse)
+    # Избранные актёры/студии держим вверху левой панели, не меняя id.
+    entries.sort(key=lambda x: not x.get("is_favorite", False))
+    if enrich:
+        for entry in entries:
+            _playa_enrich_entity_entry(kind, entry)
     return entries
 
-
-def _playa_category_entries(items: list, base_url: str) -> list:
+def _playa_category_entries(items: list, base_url: str, include_favorites: bool = True) -> list:
     by_title = {}
     for item in items:
         for title in item.get("tags", []):
@@ -1033,8 +1303,18 @@ def _playa_category_entries(items: list, base_url: str) -> list:
                     "preview": _image_url(item, base_url),
                 },
             )
-    return sorted(by_title.values(), key=lambda x: x["title"].casefold())
+    categories = sorted(by_title.values(), key=lambda x: x["title"].casefold())
+    if include_favorites:
+        categories = _playa_favorite_categories(base_url) + categories
+    return categories
 
+
+def _playa_favorite_categories(base_url: str) -> list:
+    return [
+        {"id": _PLAYA_FAV_VIDEO_CATEGORY_ID, "title": "★ Favorite videos", "preview": _placeholder_url(base_url)},
+        {"id": _PLAYA_FAV_ACTOR_CATEGORY_ID, "title": "★ Videos with favorite actors", "preview": _placeholder_url(base_url)},
+        {"id": _PLAYA_FAV_STUDIO_CATEGORY_ID, "title": "★ Videos from favorite studios", "preview": _placeholder_url(base_url)},
+    ]
 
 @app.get(f"{_PLAYA_PREFIX}/version")
 def playa_version():
@@ -1077,13 +1357,34 @@ def playa_video_detail(item_id):
     return _playa_response(_playa_video_view(item, _base_url()))
 
 
+def _playa_entity_display_title(entry: dict) -> str:
+    return f"★ {entry['title']}" if entry.get("is_favorite") else entry["title"]
+
+
+def _playa_entity_properties(entry: dict) -> list:
+    props = [
+        {"name": "Favorite", "value": "yes" if entry.get("is_favorite") else "no"},
+        {"name": "Videos", "value": str(int(entry.get("count") or 0))},
+        {"name": "Favorite videos", "value": str(int(entry.get("favorite_video_count") or 0))},
+    ]
+    if entry.get("source_url"):
+        props.append({"name": "POVR", "value": entry["source_url"]})
+    if entry.get("trailer_url"):
+        props.append({"name": "Trailer preview", "value": entry["trailer_url"]})
+    return props
+
+
 @app.get(f"{_PLAYA_PREFIX}/actors")
 def playa_actors():
     base_url = _base_url()
     entries = _playa_entity_entries("actor", _library_items(), "performers", base_url)
     page_index, page_size = _playa_page_args()
-    content = [{"id": e["id"], "title": e["title"], "preview": e["preview"]} for e in entries]
-    return _playa_response(_playa_page(content, page_index, page_size))
+    page = _playa_page(entries, page_index, page_size)
+    page["content"] = [
+        {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_enrich_entity_entry("actor", e)["preview"]}
+        for e in page["content"]
+    ]
+    return _playa_response(page)
 
 
 @app.get(f"{_PLAYA_PREFIX}/actor/<actor_id>")
@@ -1093,14 +1394,17 @@ def playa_actor_detail(actor_id):
     entry = next((e for e in entries if e["id"] == actor_id), None)
     if not entry:
         return _playa_not_found("Actor not found")
+    entry = _playa_enrich_entity_entry("actor", entry)
     return _playa_response({
         "id": entry["id"],
-        "title": entry["title"],
+        "title": _playa_entity_display_title(entry),
         "preview": entry["preview"],
+        "banner": entry.get("banner") or None,
         "studios": [
             {"id": _playa_entity_id("studio", title), "title": title}
             for title in sorted(entry["studios"], key=str.casefold)
         ],
+        "properties": _playa_entity_properties(entry),
         "aliases": [],
         "views": int(entry["count"]),
     })
@@ -1111,8 +1415,12 @@ def playa_studios():
     base_url = _base_url()
     entries = _playa_entity_entries("studio", _library_items(), "studio", base_url)
     page_index, page_size = _playa_page_args()
-    content = [{"id": e["id"], "title": e["title"], "preview": e["preview"]} for e in entries]
-    return _playa_response(_playa_page(content, page_index, page_size))
+    page = _playa_page(entries, page_index, page_size)
+    page["content"] = [
+        {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_enrich_entity_entry("studio", e)["preview"]}
+        for e in page["content"]
+    ]
+    return _playa_response(page)
 
 
 @app.get(f"{_PLAYA_PREFIX}/studio/<studio_id>")
@@ -1122,11 +1430,17 @@ def playa_studio_detail(studio_id):
     entry = next((e for e in entries if e["id"] == studio_id), None)
     if not entry:
         return _playa_not_found("Studio not found")
+    entry = _playa_enrich_entity_entry("studio", entry)
+    description = entry.get("description") or f"{entry['count']} video(s) in local deovr-bridge library."
+    if entry.get("source_url"):
+        description += f"\nPOVR: {entry['source_url']}"
+    if entry.get("trailer_url"):
+        description += f"\nTrailer preview: {entry['trailer_url']}"
     return _playa_response({
         "id": entry["id"],
-        "title": entry["title"],
+        "title": _playa_entity_display_title(entry),
         "preview": entry["preview"],
-        "description": f"{entry['count']} video(s) in local deovr-bridge library.",
+        "description": description,
         "views": int(entry["count"]),
     })
 
@@ -1140,20 +1454,87 @@ def playa_categories():
 @app.get(f"{_PLAYA_PREFIX}/categories-groups")
 @app.get(f"{_PLAYA_PREFIX}/categories-groups;")
 def playa_categories_groups():
-    categories = _playa_category_entries(_library_items(), _base_url())
-    return _playa_response([{"id": "tags", "title": "Tags", "items": categories}])
+    base_url = _base_url()
+    categories = _playa_category_entries(_library_items(), base_url, include_favorites=False)
+    return _playa_response([
+        {"id": "favorites", "title": "Favorites", "items": _playa_favorite_categories(base_url)},
+        {"id": "tags", "title": "Tags", "items": categories},
+    ])
 
 
 @app.get(f"{_PLAYA_PREFIX}/video-statuses")
 @app.get(f"{_PLAYA_PREFIX}/video-statuses;")
 def playa_video_statuses():
-    return _playa_response([])
+    return _playa_response([
+        {"id": "favorite", "title": "Favorite videos"},
+        {"id": "normal", "title": "Not favorite"},
+    ])
 
 
 @app.route(f"{_PLAYA_PREFIX}/event", methods=["PUT", "POST"])
 def playa_event():
     # Пока статистику не ведём: PLAY'A получает валидный ответ, а мы ничего не пишем.
     return _playa_response()
+
+
+def _favorite_payload(kind: str, entity_id: str) -> dict:
+    return {"kind": kind, "id": entity_id, "favorite": store.is_favorite(kind, entity_id)}
+
+
+def _validate_favorite_kind(kind: str) -> bool:
+    return kind in {"video", "actor", "studio"}
+
+
+@app.get("/favorites")
+def favorites_index():
+    """Локальный JSON-список избранного.
+
+    PLAY'A API v2 не даёт документированного write endpoint для favorites, поэтому
+    управление пока делаем простыми локальными URL/HTTP-методами:
+      POST/PUT/DELETE /favorites/<video|actor|studio>/<id>
+      GET /favorite/<video|actor|studio>/<id>/toggle
+    """
+    return jsonify({"favorites": store.all_favorites()})
+
+
+@app.route("/favorites/<kind>/<entity_id>", methods=["GET", "POST", "PUT", "DELETE"])
+def favorites_item(kind, entity_id):
+    if not _validate_favorite_kind(kind):
+        return jsonify({"error": "kind must be video, actor or studio"}), 400
+    entity_id = urllib.parse.unquote(entity_id)
+    if request.method in {"POST", "PUT"}:
+        store.set_favorite(kind, entity_id, True)
+    elif request.method == "DELETE":
+        store.set_favorite(kind, entity_id, False)
+    return jsonify(_favorite_payload(kind, entity_id))
+
+
+@app.get("/favorite/<kind>/<entity_id>/toggle")
+def favorite_toggle(kind, entity_id):
+    if not _validate_favorite_kind(kind):
+        return jsonify({"error": "kind must be video, actor or studio"}), 400
+    entity_id = urllib.parse.unquote(entity_id)
+    enabled = store.toggle_favorite(kind, entity_id)
+    return jsonify({"kind": kind, "id": entity_id, "favorite": enabled})
+
+
+@app.get("/debug/playa/video/<item_id>")
+def debug_playa_video(item_id):
+    item = _get_library_item(item_id)
+    if not item:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(_playa_video_view(item, _base_url()))
+
+
+@app.get("/debug/playa/entities")
+def debug_playa_entities():
+    base_url = _base_url()
+    items = _library_items()
+    return jsonify({
+        "actors": _playa_entity_entries("actor", items, "performers", base_url, enrich=(_playa_arg("enrich") == "1")),
+        "studios": _playa_entity_entries("studio", items, "studio", base_url, enrich=(_playa_arg("enrich") == "1")),
+        "favorites": store.all_favorites(),
+    })
 
 
 @app.get("/thumb/<item_id>")

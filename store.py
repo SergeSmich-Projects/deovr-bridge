@@ -44,6 +44,7 @@ def init_db():
                 stereo_mode TEXT,
                 video_length INTEGER DEFAULT 0,
                 video_height INTEGER,
+                created_at INTEGER,
                 updated_at INTEGER,
                 -- кэш уже построенного стрим-URL из TorrServe, чтобы не пересчитывать каждый раз
                 stream_url TEXT,
@@ -73,6 +74,12 @@ def init_db():
         # не только для фильтра MIN_VIDEO_HEIGHT_PX в scraper.py, но и для DeoVR:
         # /video/<id> должен отдавать реальный resolution, а не старый хардкод 1080.
         _ensure_column(conn, "items", "video_height", "INTEGER")
+
+        # Когда карточка впервые появилась в локальной библиотеке. updated_at может
+        # меняться при повторном upsert/обновлении метаданных, а для UI нужна именно
+        # дата добавления. Для старых БД backfill'им её прежним updated_at.
+        _ensure_column(conn, "items", "created_at", "INTEGER")
+        conn.execute("UPDATE items SET created_at = COALESCE(updated_at, strftime('%s','now')) WHERE created_at IS NULL")
 
         # сиды/личи со страницы списка раздела (NULL = неизвестно - у xxxclub их
         # в принципе нет, это DHT-магнет без страницы трекера) и скриншоты из
@@ -113,6 +120,40 @@ def init_db():
             CREATE TABLE IF NOT EXISTS kv_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+            """
+        )
+
+        # Кэш внешних метаданных для PLAY'A: постеры актёров/логотипы студий
+        # и служебные ссылки на источник. Храним только URL/текст, сами картинки
+        # не скачиваем в репозиторий/БД.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_meta (
+                kind TEXT NOT NULL,          -- actor | studio
+                entity_id TEXT NOT NULL,
+                title TEXT,
+                preview_url TEXT,
+                banner_url TEXT,
+                source_url TEXT,
+                trailer_url TEXT,
+                description TEXT,
+                updated_at INTEGER,
+                PRIMARY KEY (kind, entity_id)
+            )
+            """
+        )
+
+        # Локальное избранное. PLAY'A API v2 не документирует write-favorites,
+        # поэтому храним избранные ролики/актёров/студии у себя и экспонируем их
+        # как статусы/псевдо-категории + простые локальные HTTP endpoints.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorites (
+                kind TEXT NOT NULL,          -- video | actor | studio
+                entity_id TEXT NOT NULL,
+                created_at INTEGER,
+                PRIMARY KEY (kind, entity_id)
             )
             """
         )
@@ -158,10 +199,10 @@ def upsert_item(item: dict):
         conn.execute(
             """
             INSERT INTO items (id, topic_id, title, tags, thumbnail_url, source_type, source,
-                                screen_type, stereo_mode, video_length, video_height, updated_at,
+                                screen_type, stereo_mode, video_length, video_height, created_at, updated_at,
                                 performers, studio, site, source_rank, seeders, leechers, screenshots)
             VALUES (:id, :topic_id, :title, :tags, :thumbnail_url, :source_type, :source,
-                    :screen_type, :stereo_mode, :video_length, :video_height, :updated_at,
+                    :screen_type, :stereo_mode, :video_length, :video_height, :created_at, :updated_at,
                     :performers, :studio, :site, :source_rank, :seeders, :leechers, :screenshots)
             ON CONFLICT(id) DO UPDATE SET
                 topic_id=excluded.topic_id,
@@ -195,6 +236,7 @@ def upsert_item(item: dict):
                 "stereo_mode": item.get("stereo_mode", config.DEFAULT_STEREO_MODE),
                 "video_length": item.get("video_length", 0),
                 "video_height": _optional_int(item.get("video_height")),
+                "created_at": int(time.time()),
                 "updated_at": int(time.time()),
                 "performers": json.dumps(item.get("performers", []), ensure_ascii=False),
                 "studio": json.dumps(item.get("studio", []), ensure_ascii=False),
@@ -238,6 +280,7 @@ def _row_to_dict(r):
     d["stereo_mode"] = d.get("stereo_mode") or config.DEFAULT_STEREO_MODE
     d["video_length"] = int(d.get("video_length") or 0)
     d["video_height"] = _optional_int(d.get("video_height"))
+    d["created_at"] = int(d.get("created_at") or d.get("updated_at") or 0)
     d["source_rank"] = d.get("source_rank") if d.get("source_rank") is not None else 999999999
     d["site"] = d.get("site") or "pornolab"
     return d
@@ -301,6 +344,86 @@ def all_tags():
         for t in item["tags"]:
             tags.add(t)
     return sorted(tags)
+
+
+def get_entity_meta(kind: str, entity_id: str):
+    ensure_db()
+    with _lock, _conn() as conn:
+        r = conn.execute(
+            "SELECT * FROM entity_meta WHERE kind = ? AND entity_id = ?",
+            (kind, entity_id),
+        ).fetchone()
+        return dict(r) if r else None
+
+
+def upsert_entity_meta(kind: str, entity_id: str, title: str, preview_url: str = "",
+                       banner_url: str = "", source_url: str = "", trailer_url: str = "",
+                       description: str = ""):
+    ensure_db()
+    with _lock, _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO entity_meta (kind, entity_id, title, preview_url, banner_url,
+                                     source_url, trailer_url, description, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(kind, entity_id) DO UPDATE SET
+                title=excluded.title,
+                preview_url=excluded.preview_url,
+                banner_url=excluded.banner_url,
+                source_url=excluded.source_url,
+                trailer_url=excluded.trailer_url,
+                description=excluded.description,
+                updated_at=excluded.updated_at
+            """,
+            (kind, entity_id, title, preview_url or "", banner_url or "", source_url or "",
+             trailer_url or "", description or "", int(time.time())),
+        )
+
+
+def set_favorite(kind: str, entity_id: str, enabled: bool = True):
+    ensure_db()
+    with _lock, _conn() as conn:
+        if enabled:
+            conn.execute(
+                """
+                INSERT INTO favorites (kind, entity_id, created_at) VALUES (?, ?, ?)
+                ON CONFLICT(kind, entity_id) DO UPDATE SET created_at=excluded.created_at
+                """,
+                (kind, entity_id, int(time.time())),
+            )
+        else:
+            conn.execute("DELETE FROM favorites WHERE kind = ? AND entity_id = ?", (kind, entity_id))
+
+
+def toggle_favorite(kind: str, entity_id: str) -> bool:
+    enabled = not is_favorite(kind, entity_id)
+    set_favorite(kind, entity_id, enabled)
+    return enabled
+
+
+def is_favorite(kind: str, entity_id: str) -> bool:
+    ensure_db()
+    with _lock, _conn() as conn:
+        r = conn.execute(
+            "SELECT 1 FROM favorites WHERE kind = ? AND entity_id = ?",
+            (kind, entity_id),
+        ).fetchone()
+        return r is not None
+
+
+def favorite_ids(kind: str) -> set:
+    ensure_db()
+    with _lock, _conn() as conn:
+        rows = conn.execute("SELECT entity_id FROM favorites WHERE kind = ?", (kind,)).fetchall()
+        return {r["entity_id"] for r in rows}
+
+
+def all_favorites() -> list:
+    ensure_db()
+    with _lock, _conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT kind, entity_id, created_at FROM favorites ORDER BY created_at DESC"
+        ).fetchall()]
 
 
 def get_crawl_state(section_url: str) -> dict:
