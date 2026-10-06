@@ -1831,7 +1831,7 @@ def _playa_apply_entity_meta_to_entry(kind: str, entry: dict, meta: dict) -> dic
     return entry
 
 
-def _playa_schedule_entity_meta_refresh(kind: str, entries: list):
+def _playa_schedule_entity_meta_refresh(kind: str, entries: list, force: bool = False):
     if not config.ENABLE_EXTERNAL_ENTITY_META:
         return
     titles = []
@@ -1841,7 +1841,7 @@ def _playa_schedule_entity_meta_refresh(kind: str, entries: list):
         if not title or title in seen:
             continue
         seen.add(title)
-        if not _playa_cached_entity_meta(kind, title):
+        if force or not _playa_cached_entity_meta(kind, title):
             titles.append(title)
     if not titles:
         return
@@ -2028,7 +2028,7 @@ def playa_actors():
     entries = _playa_entity_entries("actor", _library_items(), "performers", base_url)
     page_index, page_size = _playa_page_args()
     page = _playa_page(entries, page_index, page_size)
-    _playa_schedule_entity_meta_refresh("actor", page["content"])
+    _playa_schedule_entity_meta_refresh("actor", page["content"], force=_playa_refresh_meta_requested())
     page["content"] = [
         {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_apply_cached_entity_entry("actor", e)["preview"]}
         for e in page["content"]
@@ -2065,7 +2065,7 @@ def playa_studios():
     entries = _playa_entity_entries("studio", _library_items(), "studio", base_url)
     page_index, page_size = _playa_page_args()
     page = _playa_page(entries, page_index, page_size)
-    _playa_schedule_entity_meta_refresh("studio", page["content"])
+    _playa_schedule_entity_meta_refresh("studio", page["content"], force=_playa_refresh_meta_requested())
     page["content"] = [
         {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_apply_cached_entity_entry("studio", e)["preview"]}
         for e in page["content"]
