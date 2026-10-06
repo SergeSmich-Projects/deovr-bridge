@@ -277,6 +277,7 @@ class DeoVRContractTests(unittest.TestCase):
         client = app_mod.app.test_client()
         actors = client.get("/api/playa/v2/actors", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertIn("/entity-placeholder/actor/", actors["data"]["content"][0]["preview"])
+        self.assertIn(".png?", actors["data"]["content"][0]["preview"])
         self.assertNotIn("images.povr.com", actors["data"]["content"][0]["preview"])
 
         actor_detail = client.get(f"/api/playa/v2/actor/{actor_id}", headers={"Host": "192.168.1.2:9999"}).get_json()
@@ -285,6 +286,7 @@ class DeoVRContractTests(unittest.TestCase):
 
         studios = client.get("/api/playa/v2/studios", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertIn("/entity-placeholder/studio/", studios["data"]["content"][0]["preview"])
+        self.assertIn(".png?", studios["data"]["content"][0]["preview"])
         self.assertNotIn("images.povr.com", studios["data"]["content"][0]["preview"])
 
 

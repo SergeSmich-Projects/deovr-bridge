@@ -20,10 +20,10 @@ Flask-сервер - "мост" между форумом, TorrServe и DeoVR.
 
 import base64
 import hashlib
-import html
 import logging
 import math
 import re
+import struct
 import threading
 import time
 import unicodedata
@@ -98,7 +98,7 @@ def _placeholder_url(base_url: str) -> str:
 def _entity_placeholder_url(base_url: str, kind: str, entity_id: str, title: str) -> str:
     return (
         f"{base_url}/entity-placeholder/{urllib.parse.quote(kind, safe='')}/"
-        f"{urllib.parse.quote(entity_id, safe='')}.svg?title="
+        f"{urllib.parse.quote(entity_id, safe='')}.png?title="
         f"{urllib.parse.quote(title or entity_id, safe='')}"
     )
 
@@ -452,23 +452,57 @@ def placeholder_image():
     return Response(_PLACEHOLDER_PNG, mimetype="image/png")
 
 
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+def _entity_placeholder_png(kind: str, entity_id: str) -> bytes:
+    """Небольшая PNG-заглушка без внешних зависимостей.
+
+    SVG в PLAY'A на некоторых устройствах показывается как пустая карточка, а
+    Pillow в проекте нет. Генерируем простую PNG-картинку стандартной библиотекой:
+    цвет стабилен для entity_id, актёры получают силуэт, студии — плитку.
+    """
+    digest = hashlib.sha1(f"{kind}:{entity_id}".encode("utf-8")).digest()
+    base = (70 + digest[0] % 90, 45 + digest[1] % 90, 90 + digest[2] % 120)
+    accent = (min(base[0] + 70, 255), min(base[1] + 70, 255), min(base[2] + 70, 255))
+    width = height = 300
+    rows = []
+    for y in range(height):
+        row = bytearray([0])
+        for x in range(width):
+            # Мягкий фон + простая иконка, чтобы заглушка не выглядела пустой.
+            shade = int(28 * (x / width) + 18 * (y / height))
+            r, g, b = (min(base[0] + shade, 255), min(base[1] + shade, 255), min(base[2] + shade, 255))
+            if kind == "studio":
+                if 78 <= x <= 222 and 92 <= y <= 208:
+                    r, g, b = accent
+                if (98 <= x <= 202 and 118 <= y <= 138) or (98 <= x <= 202 and 162 <= y <= 182):
+                    r, g, b = (245, 245, 245)
+            else:
+                if (x - 150) ** 2 + (y - 112) ** 2 <= 48 ** 2:
+                    r, g, b = accent
+                if ((x - 150) / 78) ** 2 + ((y - 214) / 58) ** 2 <= 1:
+                    r, g, b = accent
+            row.extend((r, g, b))
+        rows.append(bytes(row))
+    raw = b"".join(rows)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(raw, 6))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+@app.get("/entity-placeholder/<kind>/<entity_id>.png")
 @app.get("/entity-placeholder/<kind>/<entity_id>.svg")
 def entity_placeholder(kind, entity_id):
-    title = request.args.get("title") or entity_id
-    initials = "".join(part[:1] for part in re.findall(r"[A-Za-zА-Яа-я0-9]+", title))[:2].upper() or "?"
-    digest = hashlib.sha1(f"{kind}:{entity_id}".encode("utf-8")).hexdigest()
-    hue = int(digest[:2], 16)
-    bg = f"hsl({hue}, 55%, 28%)"
-    fg = "#f2f2f2"
-    label = html.escape(initials)
-    subtitle = html.escape(kind)
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300" viewBox="0 0 300 300">
-<rect width="300" height="300" rx="28" fill="{bg}"/>
-<circle cx="150" cy="118" r="56" fill="rgba(255,255,255,.18)"/>
-<text x="150" y="135" text-anchor="middle" font-family="Arial, sans-serif" font-size="56" font-weight="700" fill="{fg}">{label}</text>
-<text x="150" y="222" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" fill="rgba(255,255,255,.72)">{subtitle}</text>
-</svg>'''
-    return Response(svg, mimetype="image/svg+xml")
+    # .svg оставляем как legacy URL, но фактически отдаём PNG: PLAY'A так
+    # стабильнее показывает fallback-карточки актёров/студий.
+    resp = Response(_entity_placeholder_png(kind, entity_id), mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 
 
 @app.get("/entity-image/<kind>/<entity_id>/<digest>.<ext>")
@@ -490,7 +524,7 @@ def entity_image_proxy(kind, entity_id, digest, ext):
         content, content_type = _external_binary_get(url)
     except Exception as e:
         log.info("Не удалось проксировать entity image %s/%s: %s", kind, entity_id, e)
-        return "", 502
+        content, content_type = _entity_placeholder_png(kind, entity_id), "image/png"
     resp = Response(content, mimetype=content_type.split(";", 1)[0] or "image/jpeg")
     resp.headers["Cache-Control"] = "public, max-age=86400"
     return resp
@@ -953,16 +987,22 @@ def _cached_entity_meta_is_current(kind: str, title: str, cached: dict) -> bool:
     source_url = cached.get("source_url") or ""
     if kind == "actor":
         # Старый POVR-кэш давал одинаковые постеры. Для актёров считаем свежим
-        # только новый VRSpy-кэш (включая отрицательный результат с source_url
-        # VRSpy). Маркер принудительно инвалидирует старые строки cache.sqlite3.
-        return _has_entity_meta_source_marker(source_url) and _is_vrspy_actor_source(title, source_url) and (
-            not preview_url or _is_vrspy_actor_image_url(title, preview_url)
+        # только новый VRSpy-кэш с реальной картинкой. Отрицательный результат не
+        # считаем свежим, чтобы после исправлений/сбоев сети можно было ретраить.
+        return (
+            bool(preview_url)
+            and _has_entity_meta_source_marker(source_url)
+            and _is_vrspy_actor_source(title, source_url)
+            and _is_vrspy_actor_image_url(title, preview_url)
         )
     if kind == "studio":
         # Для студий принимаем только новый кэш с настоящими POVR logo assets, а
         # не случайные thumbnails/первую картинку со страницы.
-        return _has_entity_meta_source_marker(source_url) and _is_povr_studio_source(title, source_url) and (
-            not preview_url or _is_povr_studio_logo_url(preview_url)
+        return (
+            bool(preview_url)
+            and _has_entity_meta_source_marker(source_url)
+            and _is_povr_studio_source(title, source_url)
+            and _is_povr_studio_logo_url(preview_url)
         )
     return True
 
@@ -1028,6 +1068,112 @@ def _extract_povr_video_trailer(video_url: str) -> str:
     return preferred[0]
 
 
+_ENTITY_DIRECTORY_CACHE = {}
+_ENTITY_DIRECTORY_CACHE_TTL_SEC = 6 * 3600
+
+
+def _cached_directory_map(key: str):
+    cached = _ENTITY_DIRECTORY_CACHE.get(key)
+    if cached and (time.time() - cached[0]) < _ENTITY_DIRECTORY_CACHE_TTL_SEC:
+        return cached[1]
+    return None
+
+
+def _set_directory_map(key: str, data: dict) -> dict:
+    _ENTITY_DIRECTORY_CACHE[key] = (time.time(), data)
+    return data
+
+
+def _fetch_vrspy_actor_directory_map() -> dict:
+    key = "vrspy-stars"
+    cached = _cached_directory_map(key)
+    if cached is not None:
+        return cached
+    directory_url = urllib.parse.urljoin(config.VRSPY_BASE_URL.rstrip("/") + "/", "stars")
+    html = _external_get(directory_url)
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return _set_directory_map(key, {})
+
+    result = {}
+    for link in soup.find_all("a", href=re.compile(r"/star/", re.I)):
+        href = link.get("href") or ""
+        detail_url = _first_abs_url(directory_url, href)
+        slug = urllib.parse.urlsplit(detail_url).path.rstrip("/").rsplit("/", 1)[-1].lower()
+        if not slug or slug in result:
+            continue
+        img = link.find("img")
+        preview_url = ""
+        if img:
+            for src in _image_urls_from_tag(img, detail_url):
+                if _is_vrspy_actor_image_url(slug.replace("-", " "), src):
+                    preview_url = src
+                    break
+        if not preview_url:
+            # Иногда картинка и ссылка в HTML не вложены друг в друга. Берём
+            # первую CDN-картинку с тем же slug рядом в markup как best effort.
+            m = re.search(
+                rf"https?://cdn\.vrspy\.com/stars/{re.escape(slug)}/[^\"'<> )]+\.(?:jpg|jpeg|png|webp)(?:\?[^\"'<> )]+)?",
+                str(link),
+                re.I,
+            )
+            preview_url = _normalize_external_image_url(m.group(0)) if m else ""
+        if preview_url:
+            result[slug] = {
+                "preview_url": preview_url,
+                "banner_url": "",
+                "source_url": detail_url,
+                "trailer_url": "",
+                "description": "",
+            }
+    return _set_directory_map(key, result)
+
+
+def _fetch_povr_studio_directory_map() -> dict:
+    key = "povr-studios"
+    cached = _cached_directory_map(key)
+    if cached is not None:
+        return cached
+    directory_url = urllib.parse.urljoin(config.POVR_BASE_URL.rstrip("/") + "/", "studios")
+    html = _external_get(directory_url)
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return _set_directory_map(key, {})
+
+    result = {}
+    for link in soup.find_all("a", href=re.compile(r"/studios/", re.I)):
+        href = link.get("href") or ""
+        detail_url = _first_abs_url(directory_url, href)
+        slug = urllib.parse.urlsplit(detail_url).path.rstrip("/").rsplit("/", 1)[-1].lower()
+        if not slug:
+            continue
+        img = link.find("img")
+        img_title = (img.get("alt") if img else "") or link.get_text(" ", strip=True)
+        preview_url = ""
+        if img:
+            for src in _image_urls_from_tag(img, detail_url):
+                if _is_povr_studio_logo_url(src):
+                    preview_url = src
+                    break
+        if preview_url:
+            meta = {
+                "preview_url": preview_url,
+                "banner_url": "",
+                "source_url": detail_url,
+                "trailer_url": "",
+                "description": "",
+            }
+            result[slug] = meta
+            title_slug = _slugify_povr(img_title)
+            if title_slug:
+                result[title_slug] = meta
+    return _set_directory_map(key, result)
+
+
 def _fetch_vrspy_actor_meta(title: str) -> dict:
     """Постер актёра с VRSpy: /star/<slug> содержит явный avatar.
 
@@ -1037,6 +1183,14 @@ def _fetch_vrspy_actor_meta(title: str) -> dict:
     slug = _slugify_povr(title)
     if not slug:
         return {}
+    try:
+        directory_meta = _fetch_vrspy_actor_directory_map().get(slug)
+    except Exception as e:
+        log.debug("Не удалось получить VRSpy stars directory: %s", e)
+        directory_meta = None
+    if directory_meta and directory_meta.get("preview_url"):
+        return directory_meta
+
     source_url = urllib.parse.urljoin(config.VRSPY_BASE_URL.rstrip("/") + "/", f"star/{slug}")
     html = _external_get(source_url)
     try:
@@ -1103,45 +1257,15 @@ def _fetch_vrspy_actor_meta(title: str) -> dict:
 
 
 def _fetch_povr_studio_directory_meta(title: str) -> dict:
-    """Точное соответствие studio -> logo из общей POVR-директории.
-
-    Detail-страница при неудачном slug иногда возвращает не то содержимое, из-за
-    чего можно было подобрать логотип другой студии. В директории `/studios` logo
-    находится рядом с названием/ссылкой; используем только точное совпадение slug.
-    """
     slug = _slugify_povr(title)
     if not slug:
         return {}
-    directory_url = urllib.parse.urljoin(config.POVR_BASE_URL.rstrip("/") + "/", "studios")
-    html = _external_get(directory_url)
     try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception:
+        return _fetch_povr_studio_directory_map().get(slug) or {}
+    except Exception as e:
+        log.debug("Не удалось получить POVR studios directory: %s", e)
         return {}
-    for link in soup.find_all("a", href=re.compile(r"/studios/", re.I)):
-        href = link.get("href") or ""
-        detail_url = _first_abs_url(directory_url, href)
-        path_slug = urllib.parse.urlsplit(detail_url).path.rstrip("/").rsplit("/", 1)[-1].lower()
-        img = link.find("img")
-        img_title = (img.get("alt") if img else "") or link.get_text(" ", strip=True)
-        if not (_slugs_match(path_slug, slug) or _slugs_match(_slugify_povr(img_title), slug)):
-            continue
-        preview_url = ""
-        if img:
-            for src in _image_urls_from_tag(img, detail_url):
-                if _is_povr_studio_logo_url(src):
-                    preview_url = src
-                    break
-        if preview_url:
-            return {
-                "preview_url": preview_url,
-                "banner_url": "",
-                "source_url": detail_url,
-                "trailer_url": "",
-                "description": "",
-            }
-    return {}
+
 
 
 def _fetch_povr_entity_meta(kind: str, title: str) -> dict:
@@ -1225,12 +1349,19 @@ def _fetch_povr_entity_meta(kind: str, title: str) -> dict:
     }
 
 
-def _playa_entity_meta(kind: str, title: str) -> dict:
+def _playa_refresh_meta_requested() -> bool:
+    try:
+        return _playa_arg("refresh") == "1" or _playa_arg("refresh-meta") == "1"
+    except RuntimeError:
+        return False
+
+
+def _playa_entity_meta(kind: str, title: str, force_refresh: bool = False) -> dict:
     entity_id = _playa_entity_id(kind, title)
     cached = store.get_entity_meta(kind, entity_id)
     now = int(time.time())
     cache_current = _cached_entity_meta_is_current(kind, title, cached)
-    force_refresh = (_playa_arg("refresh") == "1" or _playa_arg("refresh-meta") == "1")
+    force_refresh = force_refresh or _playa_refresh_meta_requested()
     if cached and cache_current and not force_refresh and (now - int(cached.get("updated_at") or 0)) < config.EXTERNAL_ENTITY_META_TTL_SEC:
         return cached
     if not config.ENABLE_EXTERNAL_ENTITY_META:
@@ -1552,19 +1683,72 @@ def _playa_filter_videos(items: list) -> list:
     return filtered
 
 
+_ENTITY_META_REFRESHING = set()
+_ENTITY_META_REFRESH_LOCK = threading.Lock()
+
+
+def _playa_cached_entity_meta(kind: str, title: str) -> dict:
+    cached = store.get_entity_meta(kind, _playa_entity_id(kind, title))
+    return cached if _cached_entity_meta_is_current(kind, title, cached) else {}
+
+
+def _playa_apply_entity_meta_to_entry(kind: str, entry: dict, meta: dict) -> dict:
+    if meta.get("preview_url"):
+        entry["preview"] = _normalize_external_image_url(meta["preview_url"])
+    if meta.get("banner_url"):
+        entry["banner"] = _normalize_external_image_url(meta["banner_url"])
+    entry["description"] = meta.get("description") or entry.get("description") or ""
+    entry["source_url"] = meta.get("source_url") or entry.get("source_url") or ""
+    entry["trailer_url"] = meta.get("trailer_url") or entry.get("trailer_url") or ""
+    return entry
+
+
+def _playa_schedule_entity_meta_refresh(kind: str, entries: list):
+    if not config.ENABLE_EXTERNAL_ENTITY_META:
+        return
+    titles = []
+    seen = set()
+    for entry in entries[:60]:
+        title = entry.get("title") or ""
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        if not _playa_cached_entity_meta(kind, title):
+            titles.append(title)
+    if not titles:
+        return
+    key = (kind, hashlib.sha1("\n".join(sorted(titles)).encode("utf-8")).hexdigest()[:16])
+    with _ENTITY_META_REFRESH_LOCK:
+        if key in _ENTITY_META_REFRESHING:
+            return
+        _ENTITY_META_REFRESHING.add(key)
+
+    def worker():
+        try:
+            for title in titles:
+                try:
+                    _playa_entity_meta(kind, title, force_refresh=True)
+                except Exception as e:
+                    log.info("Фоновое обновление metadata %s %r не удалось: %s", kind, title, e)
+        finally:
+            with _ENTITY_META_REFRESH_LOCK:
+                _ENTITY_META_REFRESHING.discard(key)
+
+    threading.Thread(target=worker, name=f"playa-{kind}-meta-refresh", daemon=True).start()
+
+
+def _playa_apply_cached_entity_entry(kind: str, entry: dict) -> dict:
+    meta = _playa_cached_entity_meta(kind, entry["title"])
+    if meta:
+        _playa_apply_entity_meta_to_entry(kind, entry, meta)
+    return entry
+
+
 def _playa_enrich_entity_entry(kind: str, entry: dict, base_url: str = None) -> dict:
     if entry.get("_enriched"):
         return entry
     meta = _playa_entity_meta(kind, entry["title"])
-    if meta.get("preview_url"):
-        entry["preview"] = _external_image_url(base_url, kind, entry["id"], meta["preview_url"]) if base_url else meta["preview_url"]
-    entry["banner"] = (
-        _external_image_url(base_url, kind, entry["id"], meta.get("banner_url"))
-        if base_url and meta.get("banner_url") else (meta.get("banner_url") or "")
-    )
-    entry["description"] = meta.get("description") or ""
-    entry["source_url"] = meta.get("source_url") or ""
-    entry["trailer_url"] = meta.get("trailer_url") or ""
+    _playa_apply_entity_meta_to_entry(kind, entry, meta)
     entry["_enriched"] = True
     return entry
 
@@ -1685,8 +1869,9 @@ def playa_actors():
     entries = _playa_entity_entries("actor", _library_items(), "performers", base_url)
     page_index, page_size = _playa_page_args()
     page = _playa_page(entries, page_index, page_size)
+    _playa_schedule_entity_meta_refresh("actor", page["content"])
     page["content"] = [
-        {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_enrich_entity_entry("actor", e, base_url)["preview"]}
+        {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_apply_cached_entity_entry("actor", e)["preview"]}
         for e in page["content"]
     ]
     return _playa_response(page)
@@ -1721,8 +1906,9 @@ def playa_studios():
     entries = _playa_entity_entries("studio", _library_items(), "studio", base_url)
     page_index, page_size = _playa_page_args()
     page = _playa_page(entries, page_index, page_size)
+    _playa_schedule_entity_meta_refresh("studio", page["content"])
     page["content"] = [
-        {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_enrich_entity_entry("studio", e, base_url)["preview"]}
+        {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_apply_cached_entity_entry("studio", e)["preview"]}
         for e in page["content"]
     ]
     return _playa_response(page)
