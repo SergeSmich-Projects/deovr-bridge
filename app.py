@@ -1081,6 +1081,24 @@ def _set_directory_map(key: str, data: dict) -> dict:
     return data
 
 
+def _external_get_json(url: str, headers: dict = None) -> dict:
+    timeout = config.EXTERNAL_ENTITY_META_TIMEOUT_SEC
+    req_headers = {
+        "User-Agent": "PLAYA/1.0 deovr-bridge/1.0",
+        "Accept": "application/json",
+    }
+    if headers:
+        req_headers.update(headers)
+    try:
+        from curl_cffi import requests as curl_requests
+        resp = curl_requests.get(url, headers=req_headers, timeout=timeout, impersonate="chrome124")
+    except Exception:
+        import requests
+        resp = requests.get(url, headers=req_headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def _external_post_json(url: str, payload: dict, headers: dict = None) -> dict:
     timeout = config.EXTERNAL_ENTITY_META_TIMEOUT_SEC
     req_headers = {
@@ -1099,6 +1117,75 @@ def _external_post_json(url: str, payload: dict, headers: dict = None) -> dict:
         resp = requests.post(url, data=body, headers=req_headers, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
+
+
+def _playa_api_url(base_url: str, path: str, query: dict = None) -> str:
+    url = urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    return url
+
+
+def _best_playa_list_match(content: list, title: str) -> dict:
+    if not isinstance(content, list):
+        return {}
+    slug = _slugify_povr(title)
+    exact = []
+    for entry in content:
+        entry_title = entry.get("title") or ""
+        entry_id = entry.get("id") or ""
+        if _slugs_match(_slugify_povr(entry_title), slug) or _slugs_match(_slugify_povr(entry_id), slug):
+            exact.append(entry)
+    if exact:
+        return exact[0]
+    return content[0] if content else {}
+
+
+def _fetch_vrporn_playa_entity_meta(kind: str, title: str) -> dict:
+    """Берём artwork напрямую из PLAY'A API VRPorn.com.
+
+    Это ровно тот источник/формат, который сам PLAY'A уже умеет показывать:
+    /api/playa/v2/actors и /studios отдают preview URL для карточек, detail —
+    тот же preview плюс описание/свойства. Никакого HTML-скрейпинга и guessing.
+    """
+    if kind == "actor":
+        collection = "actors"
+        detail_prefix = "actor"
+    elif kind == "studio":
+        collection = "studios"
+        detail_prefix = "studio"
+    else:
+        return {}
+    base_url = config.VRPORN_BASE_URL.rstrip("/")
+    search_url = _playa_api_url(base_url, f"/api/playa/v2/{collection}", {"title": title, "page-size": 8})
+    payload = _external_get_json(search_url)
+    if int(((payload.get("status") or {}).get("code") or 0)) != 1:
+        return {}
+    page = payload.get("data") or {}
+    entry = _best_playa_list_match(page.get("content") or [], title)
+    if not entry:
+        return {}
+    entity_id = entry.get("id") or _slugify_povr(title)
+    detail_url = _playa_api_url(base_url, f"/api/playa/v2/{detail_prefix}/{urllib.parse.quote(entity_id, safe='')}")
+    detail = {}
+    try:
+        detail_payload = _external_get_json(detail_url)
+        if int(((detail_payload.get("status") or {}).get("code") or 0)) == 1:
+            detail = detail_payload.get("data") or {}
+    except Exception as e:
+        log.debug("VRPorn detail %s %r недоступен: %s", kind, title, e)
+    preview_url = _normalize_external_image_url(detail.get("preview") or entry.get("preview") or "")
+    if not preview_url:
+        return {}
+    description = detail.get("description") or ""
+    return {
+        "preview_url": preview_url,
+        "banner_url": _normalize_external_image_url(detail.get("banner") or ""),
+        "source_url": detail_url,
+        "trailer_url": "",
+        "description": description,
+    }
+
 
 
 def _stashbox_headers(api_key: str) -> dict:
@@ -1489,16 +1576,22 @@ def _playa_entity_meta(kind: str, title: str, force_refresh: bool = False) -> di
         return cached if cache_current else {}
 
     try:
-        meta = _fetch_stashbox_entity_meta(kind, title)
+        # Самый простой и точный путь: взять artwork из PLAY'A API VRPorn.com.
+        # Этот сайт уже подключается в PLAY'A и отдаёт actors/studios с preview.
+        meta = _fetch_vrporn_playa_entity_meta(kind, title)
     except Exception as e:
-        log.info("Не удалось обновить StashBox-метаданные %s %r: %s", kind, title, e)
+        log.info("Не удалось обновить VRPorn PLAY'A metadata %s %r: %s", kind, title, e)
         meta = {}
 
     if not meta.get("preview_url"):
+        try:
+            meta = _fetch_stashbox_entity_meta(kind, title)
+        except Exception as e:
+            log.info("Не удалось обновить StashBox-метаданные %s %r: %s", kind, title, e)
+            meta = {}
+
+    if not meta.get("preview_url"):
         if kind == "actor":
-            # После жалобы на одинаковые POVR-постеры актёров используем только
-            # VRSpy как публичный fallback. Если VRSpy не нашёл актёра, PLAY'A
-            # получит уникальный локальный PNG-placeholder вместо чужой картинки.
             try:
                 meta = _fetch_vrspy_actor_meta(title)
             except Exception as e:
@@ -1517,8 +1610,8 @@ def _playa_entity_meta(kind: str, title: str, force_refresh: bool = False) -> di
     if not any(meta.get(key) for key in ("preview_url", "banner_url", "source_url", "trailer_url", "description")):
         return cached if cache_current else {}
 
-    # Кэшируем и отрицательный результат с source_url, чтобы не стучаться во
-    # внешний сайт на каждый запрос PLAY'A, если артиста/студию там не нашли.
+    # Кэшируем успешный результат; старые/пустые результаты не закрепляем,
+    # чтобы повторный refresh мог подтянуть появившиеся картинки.
     store.upsert_entity_meta(
         kind,
         entity_id,

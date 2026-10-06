@@ -327,6 +327,38 @@ class DeoVRContractTests(unittest.TestCase):
         actors = client.get("/api/playa/v2/actors", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertEqual(actors["data"]["content"][0]["title"], "Actor One")
 
+    def test_vrporn_playa_metadata_provider_uses_playa_preview_fields(self):
+        db_path = _temp_db(self)
+        app_mod, _store_mod = _load_app_for_db(db_path)
+        calls = []
+
+        def fake_get_json(url, headers=None):
+            calls.append(url)
+            if "/actors" in url:
+                return {
+                    "status": {"code": 1},
+                    "data": {"content": [{"id": "blake-blossom", "title": "Blake Blossom", "preview": "https://cdn.vrporn.com/models/blake-blossom/profile.jpg"}]},
+                }
+            if "/actor/blake-blossom" in url:
+                return {"status": {"code": 1}, "data": {"preview": "https://cdn.vrporn.com/models/blake-blossom/detail.jpg", "banner": None}}
+            if "/studios" in url:
+                return {
+                    "status": {"code": 1},
+                    "data": {"content": [{"id": "vrbangers", "title": "VR Bangers", "preview": "https://cdn.vrporn.com/studios/vrbangers/logo.jpg"}]},
+                }
+            if "/studio/vrbangers" in url:
+                return {"status": {"code": 1}, "data": {"preview": "https://cdn.vrporn.com/studios/vrbangers/detail-logo.jpg", "description": "Studio description"}}
+            raise AssertionError(url)
+
+        app_mod._external_get_json = fake_get_json
+        actor = app_mod._fetch_vrporn_playa_entity_meta("actor", "Blake Blossom")
+        self.assertEqual(actor["preview_url"], "https://cdn.vrporn.com/models/blake-blossom/detail.jpg")
+        self.assertIn("/api/playa/v2/actor/blake-blossom", actor["source_url"])
+        studio = app_mod._fetch_vrporn_playa_entity_meta("studio", "VR Bangers")
+        self.assertEqual(studio["preview_url"], "https://cdn.vrporn.com/studios/vrbangers/detail-logo.jpg")
+        self.assertEqual(studio["description"], "Studio description")
+        self.assertTrue(any("title=Blake+Blossom" in url for url in calls))
+
 
 if __name__ == "__main__":
     unittest.main()

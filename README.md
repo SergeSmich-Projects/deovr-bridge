@@ -133,12 +133,13 @@ HIDDEN_LIBRARY_SITE_IDS=
 
 Для страниц Actors/Studios мост лениво пробует подтягивать публичные картинки:
 
-- если задан `STASHBOX_METADATA_PROVIDERS`, сначала пробует структурированные Stash-Box endpoints (например ThePornDB/StashDB) и берёт `images` у performer/studio;
-- актёры: публичный fallback `https://www.vrspy.com/stars` / `https://www.vrspy.com/star/<actor-slug>` → avatar/poster; старый POVR-кэш для актёров игнорируется, чтобы не показывать один и тот же чужой постер;
-- студии: публичный fallback сначала ищет точное совпадение в `https://povr.com/studios` → PNG logo, затем detail `https://povr.com/studios/<studio-slug>` только если страница точно совпала со студией; старый кэш студий автоматически пересобирается, чтобы убрать ошибочно подобранные чужие логотипы;
+- основной простой источник — PLAY'A API сайта `https://vrporn.com`: `/api/playa/v2/actors`, `/actor/<id>`, `/studios`, `/studio/<id>` уже отдают готовые `preview` для актёров и логотипов студий;
+- если задан `STASHBOX_METADATA_PROVIDERS`, дополнительно можно пробовать структурированные Stash-Box endpoints (например ThePornDB/StashDB) и брать `images` у performer/studio;
+- fallback для актёров: `https://www.vrspy.com/stars` / `https://www.vrspy.com/star/<actor-slug>`;
+- fallback для студий: `https://povr.com/studios` / `https://povr.com/studios/<studio-slug>`;
 - если на странице удаётся найти трейлер одного из роликов, его URL сохраняется только как служебная ссылка в debug/metadata.
 
-Stash-Box provider включается через переменную окружения или локальный `.env` файл (он в `.gitignore`, ключи не коммитить):
+Stash-Box provider включается через переменную окружения или локальный `.env` файл (он в `.gitignore`, ключи не коммитить), но для VRPorn PLAY'A API ключ не нужен:
 
 ```bash
 STASHBOX_METADATA_PROVIDERS="https://theporndb.net/graphql|TPDB_API_KEY;https://stashdb.org/graphql|STASHDB_API_KEY"

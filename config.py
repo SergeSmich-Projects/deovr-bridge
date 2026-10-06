@@ -200,6 +200,7 @@ EXTERNAL_ENTITY_META_TTL_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TTL_SEC"
 EXTERNAL_ENTITY_META_TIMEOUT_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TIMEOUT_SEC", "8"))
 POVR_BASE_URL = os.environ.get("POVR_BASE_URL", "https://povr.com")
 VRSPY_BASE_URL = os.environ.get("VRSPY_BASE_URL", "https://www.vrspy.com")
+VRPORN_BASE_URL = os.environ.get("VRPORN_BASE_URL", "https://vrporn.com")
 # Опциональные структурированные metadata-провайдеры Stash-Box (например,
 # ThePornDB/StashDB). Формат env:
 # STASHBOX_METADATA_PROVIDERS="https://theporndb.net/graphql|API_KEY;https://stashdb.org/graphql|API_KEY"
