@@ -144,6 +144,22 @@ def init_db():
             """
         )
 
+        # Локальные списки актёров/студий. Это не дублирует нативное избранное
+        # PLAY'A для видео: клиент не умеет добавлять actor/studio в избранное,
+        # поэтому держим только entity-level списки, управляемые нашим web UI/API.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_lists (
+                list_name TEXT NOT NULL,
+                kind TEXT NOT NULL,          -- actor | studio
+                entity_id TEXT NOT NULL,
+                title TEXT,
+                created_at INTEGER,
+                PRIMARY KEY (list_name, kind, entity_id)
+            )
+            """
+        )
+
         _db_initialized = True
         _db_initialized_path = config.DB_PATH
 
@@ -364,6 +380,70 @@ def upsert_entity_meta(kind: str, entity_id: str, title: str, preview_url: str =
             (kind, entity_id, title, preview_url or "", banner_url or "", source_url or "",
              trailer_url or "", description or "", int(time.time())),
         )
+
+
+def set_entity_in_list(list_name: str, kind: str, entity_id: str, title: str = "", enabled: bool = True):
+    ensure_db()
+    with _lock, _conn() as conn:
+        if enabled:
+            conn.execute(
+                """
+                INSERT INTO entity_lists (list_name, kind, entity_id, title, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(list_name, kind, entity_id) DO UPDATE SET
+                    title=excluded.title
+                """,
+                (list_name, kind, entity_id, title or "", int(time.time())),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM entity_lists WHERE list_name = ? AND kind = ? AND entity_id = ?",
+                (list_name, kind, entity_id),
+            )
+
+
+def toggle_entity_in_list(list_name: str, kind: str, entity_id: str, title: str = "") -> bool:
+    enabled = not is_entity_in_list(list_name, kind, entity_id)
+    set_entity_in_list(list_name, kind, entity_id, title, enabled)
+    return enabled
+
+
+def is_entity_in_list(list_name: str, kind: str, entity_id: str) -> bool:
+    ensure_db()
+    with _lock, _conn() as conn:
+        r = conn.execute(
+            "SELECT 1 FROM entity_lists WHERE list_name = ? AND kind = ? AND entity_id = ?",
+            (list_name, kind, entity_id),
+        ).fetchone()
+        return r is not None
+
+
+def entity_list_ids(list_name: str, kind: str) -> set:
+    ensure_db()
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            "SELECT entity_id FROM entity_lists WHERE list_name = ? AND kind = ?",
+            (list_name, kind),
+        ).fetchall()
+        return {r["entity_id"] for r in rows}
+
+
+def all_entity_list_entries(list_name: str = None, kind: str = None) -> list:
+    ensure_db()
+    where = []
+    args = []
+    if list_name is not None:
+        where.append("list_name = ?")
+        args.append(list_name)
+    if kind is not None:
+        where.append("kind = ?")
+        args.append(kind)
+    sql = "SELECT list_name, kind, entity_id, title, created_at FROM entity_lists"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC, title COLLATE NOCASE ASC"
+    with _lock, _conn() as conn:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
 

@@ -176,6 +176,24 @@ EXTERNAL_ENTITY_META_TTL_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TTL_SEC"
 EXTERNAL_ENTITY_META_TIMEOUT_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TIMEOUT_SEC", "8"))
 POVR_BASE_URL = os.environ.get("POVR_BASE_URL", "https://povr.com")
 VRSPY_BASE_URL = os.environ.get("VRSPY_BASE_URL", "https://www.vrspy.com")
+# Опциональные структурированные metadata-провайдеры Stash-Box (например,
+# ThePornDB/StashDB). Формат env:
+# STASHBOX_METADATA_PROVIDERS="https://theporndb.net/graphql|API_KEY;https://stashdb.org/graphql|API_KEY"
+# Ключи не коммитим; переменная пустая по умолчанию.
+STASHBOX_METADATA_PROVIDERS = []
+for _raw_provider in os.environ.get("STASHBOX_METADATA_PROVIDERS", "").split(";"):
+    _raw_provider = _raw_provider.strip()
+    if not _raw_provider:
+        continue
+    if "|" in _raw_provider:
+        _endpoint, _api_key = _raw_provider.split("|", 1)
+    else:
+        _endpoint, _api_key = _raw_provider, ""
+    if _endpoint.strip():
+        STASHBOX_METADATA_PROVIDERS.append({"endpoint": _endpoint.strip(), "api_key": _api_key.strip()})
+
+# Локальный список актёров/студий (web UI + звёздочки/сортировка в PLAY'A).
+ENTITY_LIST_DEFAULT_NAME = os.environ.get("ENTITY_LIST_DEFAULT_NAME", "watchlist")
 
 REFRESH_INTERVAL_SEC = int(os.environ.get("REFRESH_INTERVAL_SEC", "3600"))
 

@@ -20,6 +20,8 @@ Flask-сервер - "мост" между форумом, TorrServe и DeoVR.
 
 import base64
 import hashlib
+import html
+import json
 import logging
 import math
 import re
@@ -987,23 +989,18 @@ def _cached_entity_meta_is_current(kind: str, title: str, cached: dict) -> bool:
     source_url = cached.get("source_url") or ""
     if kind == "actor":
         # Старый POVR-кэш давал одинаковые постеры. Для актёров считаем свежим
-        # только новый VRSpy-кэш с реальной картинкой. Отрицательный результат не
-        # считаем свежим, чтобы после исправлений/сбоев сети можно было ретраить.
-        return (
-            bool(preview_url)
-            and _has_entity_meta_source_marker(source_url)
-            and _is_vrspy_actor_source(title, source_url)
-            and _is_vrspy_actor_image_url(title, preview_url)
-        )
+        # только новый кэш с реальной картинкой: либо VRSpy, либо опциональный
+        # StashBox provider. Отрицательный результат не считаем свежим, чтобы
+        # после исправлений/сбоев сети можно было ретраить.
+        if not (preview_url and _has_entity_meta_source_marker(source_url)):
+            return False
+        return _is_vrspy_actor_source(title, source_url) and _is_vrspy_actor_image_url(title, preview_url) or bool(preview_url)
     if kind == "studio":
-        # Для студий принимаем только новый кэш с настоящими POVR logo assets, а
-        # не случайные thumbnails/первую картинку со страницы.
-        return (
-            bool(preview_url)
-            and _has_entity_meta_source_marker(source_url)
-            and _is_povr_studio_source(title, source_url)
-            and _is_povr_studio_logo_url(preview_url)
-        )
+        # Для студий принимаем только новый кэш с настоящими POVR logo assets или
+        # опциональный StashBox provider, а не случайные thumbnails/первую картинку.
+        if not (preview_url and _has_entity_meta_source_marker(source_url)):
+            return False
+        return _is_povr_studio_source(title, source_url) and _is_povr_studio_logo_url(preview_url) or bool(preview_url)
     return True
 
 
@@ -1082,6 +1079,130 @@ def _cached_directory_map(key: str):
 def _set_directory_map(key: str, data: dict) -> dict:
     _ENTITY_DIRECTORY_CACHE[key] = (time.time(), data)
     return data
+
+
+def _external_post_json(url: str, payload: dict, headers: dict = None) -> dict:
+    timeout = config.EXTERNAL_ENTITY_META_TIMEOUT_SEC
+    req_headers = {
+        "User-Agent": "deovr-bridge/1.0",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if headers:
+        req_headers.update(headers)
+    body = json.dumps(payload).encode("utf-8")
+    try:
+        from curl_cffi import requests as curl_requests
+        resp = curl_requests.post(url, data=body, headers=req_headers, timeout=timeout, impersonate="chrome124")
+    except Exception:
+        import requests
+        resp = requests.post(url, data=body, headers=req_headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _stashbox_headers(api_key: str) -> dict:
+    headers = {}
+    if api_key:
+        # Разные Stash/Stash-Box инсталляции встречаются с разными схемами.
+        # Обычно достаточно ApiKey, Authorization оставляем как совместимый bonus.
+        headers["ApiKey"] = api_key
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _pick_stashbox_image(images) -> str:
+    if not isinstance(images, list):
+        return ""
+    candidates = []
+    for image in images:
+        if isinstance(image, str):
+            candidates.append(image)
+        elif isinstance(image, dict):
+            for key in ("url", "image", "path", "thumbnail", "thumbnail_url"):
+                value = image.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    candidates.append(value)
+                    break
+    for url in candidates:
+        if url.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            return _normalize_external_image_url(url)
+    return _normalize_external_image_url(candidates[0]) if candidates else ""
+
+
+def _fetch_stashbox_entity_meta(kind: str, title: str) -> dict:
+    """Опциональный Stash-Box provider (ThePornDB/StashDB/etc.).
+
+    Stash-Box — структурированная GraphQL-БД с performers/studios/images. Нужен
+    API key, поэтому provider выключен по умолчанию и включается env-переменной.
+    Если схема конкретного endpoint немного отличается, просто пропускаем его и
+    продолжаем публичные VRSpy/POVR fallback'и.
+    """
+    providers = getattr(config, "STASHBOX_METADATA_PROVIDERS", []) or []
+    if not providers:
+        return {}
+    slug = _slugify_povr(title)
+    if not slug:
+        return {}
+    if kind == "actor":
+        field, items_field, type_name = "queryPerformers", "performers", "Performer"
+        extra = "aliases images { url } urls { url }"
+    elif kind == "studio":
+        field, items_field, type_name = "queryStudios", "studios", "Studio"
+        extra = "aliases images { url } urls { url }"
+    else:
+        return {}
+    query = f"""
+    query {type_name}Search($name: String!) {{
+      {field}(input: {{ name: $name }}) {{
+        {items_field} {{
+          id
+          name
+          {extra}
+        }}
+      }}
+    }}
+    """
+    for provider in providers:
+        endpoint = (provider.get("endpoint") or "").strip()
+        if not endpoint:
+            continue
+        try:
+            data = _external_post_json(
+                endpoint,
+                {"query": query, "variables": {"name": title}},
+                headers=_stashbox_headers(provider.get("api_key") or ""),
+            )
+        except Exception as e:
+            log.info("StashBox %s %r недоступен: %s", kind, title, e)
+            continue
+        if data.get("errors"):
+            log.debug("StashBox %s %r вернул errors: %s", kind, title, data.get("errors"))
+            continue
+        rows = (((data.get("data") or {}).get(field) or {}).get(items_field) or [])
+        best = None
+        for row in rows:
+            name = row.get("name") or ""
+            aliases = row.get("aliases") or []
+            slugs = {_slugify_povr(name), *(_slugify_povr(a) for a in aliases if isinstance(a, str))}
+            if slug in slugs or any(_slugs_match(s, slug) for s in slugs):
+                best = row
+                break
+        if not best and rows:
+            best = rows[0]
+        if not best:
+            continue
+        preview_url = _pick_stashbox_image(best.get("images"))
+        if not preview_url:
+            continue
+        return {
+            "preview_url": preview_url,
+            "banner_url": "",
+            "source_url": f"{endpoint.rstrip('/')}?{kind}={urllib.parse.quote(best.get('id') or slug, safe='')}",
+            "trailer_url": "",
+            "description": "",
+        }
+    return {}
 
 
 def _fetch_vrspy_actor_directory_map() -> dict:
@@ -1367,21 +1488,28 @@ def _playa_entity_meta(kind: str, title: str, force_refresh: bool = False) -> di
     if not config.ENABLE_EXTERNAL_ENTITY_META:
         return cached if cache_current else {}
 
-    if kind == "actor":
-        # После жалобы на одинаковые POVR-постеры актёров используем только VRSpy.
-        # Если VRSpy не нашёл актёра, ниже закэшируется отрицательный результат и
-        # PLAY'A получит уникальный локальный placeholder вместо чужой картинки.
-        try:
-            meta = _fetch_vrspy_actor_meta(title)
-        except Exception as e:
-            log.info("Не удалось обновить VRSpy-метаданные actor %r: %s", title, e)
-            meta = {}
-    else:
-        try:
-            meta = _fetch_povr_entity_meta(kind, title)
-        except Exception as e:
-            log.info("Не удалось обновить внешние метаданные %s %r: %s", kind, title, e)
-            meta = {}
+    try:
+        meta = _fetch_stashbox_entity_meta(kind, title)
+    except Exception as e:
+        log.info("Не удалось обновить StashBox-метаданные %s %r: %s", kind, title, e)
+        meta = {}
+
+    if not meta.get("preview_url"):
+        if kind == "actor":
+            # После жалобы на одинаковые POVR-постеры актёров используем только
+            # VRSpy как публичный fallback. Если VRSpy не нашёл актёра, PLAY'A
+            # получит уникальный локальный PNG-placeholder вместо чужой картинки.
+            try:
+                meta = _fetch_vrspy_actor_meta(title)
+            except Exception as e:
+                log.info("Не удалось обновить VRSpy-метаданные actor %r: %s", title, e)
+                meta = {}
+        else:
+            try:
+                meta = _fetch_povr_entity_meta(kind, title)
+            except Exception as e:
+                log.info("Не удалось обновить внешние метаданные %s %r: %s", kind, title, e)
+                meta = {}
 
     # Если обновление временно не удалось, не стираем уже хороший кэш. Но старый
     # неподходящий кэш (например, POVR actor или не-logo studio image) больше не
@@ -1744,6 +1872,30 @@ def _playa_apply_cached_entity_entry(kind: str, entry: dict) -> dict:
     return entry
 
 
+def _entity_list_name() -> str:
+    return config.ENTITY_LIST_DEFAULT_NAME or "watchlist"
+
+
+def _valid_entity_list_kind(kind: str) -> bool:
+    return kind in {"actor", "studio"}
+
+
+def _entity_title_from_id(kind: str, entity_id: str) -> str:
+    field = "performers" if kind == "actor" else "studio"
+    for item in _library_items():
+        for title in item.get(field, []):
+            if _playa_entity_id(kind, title) == entity_id:
+                return title
+    return entity_id
+
+
+def _entity_list_toggle_url(base_url: str, kind: str, entity_id: str, title: str) -> str:
+    return (
+        f"{base_url}/entity-list/{urllib.parse.quote(kind, safe='')}/"
+        f"{urllib.parse.quote(entity_id, safe='')}/toggle?title={urllib.parse.quote(title or entity_id, safe='')}"
+    )
+
+
 def _playa_enrich_entity_entry(kind: str, entry: dict, base_url: str = None) -> dict:
     if entry.get("_enriched"):
         return entry
@@ -1755,6 +1907,7 @@ def _playa_enrich_entity_entry(kind: str, entry: dict, base_url: str = None) -> 
 
 def _playa_entity_entries(kind: str, items: list, field: str, base_url: str, enrich: bool = False) -> list:
     by_title = {}
+    listed_ids = store.entity_list_ids(_entity_list_name(), kind) if _valid_entity_list_kind(kind) else set()
     for item in items:
         for title in item.get(field, []):
             if not title:
@@ -1772,8 +1925,10 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str, enr
                     "trailer_url": "",
                     "count": 0,
                     "studios": set(),
+                    "in_list": entity_id in listed_ids,
                 },
             )
+            entry["in_list"] = entry["id"] in listed_ids
             entry["count"] += 1
             entry["studios"].update(item.get("studio", []))
 
@@ -1788,6 +1943,8 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str, enr
         entries.sort(key=lambda x: (x["count"], x["title"].casefold()), reverse=reverse)
     else:
         entries.sort(key=lambda x: x["title"].casefold(), reverse=reverse)
+    # Локальный actor/studio list: держим отмеченные сущности сверху, не меняя id.
+    entries.sort(key=lambda x: not x.get("in_list", False))
     if enrich:
         for entry in entries:
             _playa_enrich_entity_entry(kind, entry, base_url)
@@ -1853,14 +2010,16 @@ def playa_video_detail(item_id):
 
 
 def _playa_entity_display_title(entry: dict) -> str:
-    return entry["title"]
+    return f"★ {entry['title']}" if entry.get("in_list") else entry["title"]
 
 
 def _playa_entity_properties(entry: dict) -> list:
     # ActorView/StudioView properties in PLAY'A are plain text, not clickable
-    # links. Поэтому не выводим сюда source/trailer URL: они остаются только в
-    # debug/entity_meta, пока не найдём нативный кликабельный способ в клиенте.
-    return [{"name": "Videos", "value": str(int(entry.get("count") or 0))}]
+    # links. Поэтому управление списком делаем через web UI /entity-lists, а не
+    # через некликабельные URL в карточке.
+    props = [{"name": "Videos", "value": str(int(entry.get("count") or 0))}]
+    props.append({"name": "Local list", "value": "yes" if entry.get("in_list") else "no"})
+    return props
 
 
 @app.get(f"{_PLAYA_PREFIX}/actors")
@@ -1955,6 +2114,97 @@ def playa_video_statuses():
 def playa_event():
     # Пока статистику не ведём: PLAY'A получает валидный ответ, а мы ничего не пишем.
     return _playa_response()
+
+
+
+def _entity_list_payload() -> dict:
+    return {"list_name": _entity_list_name(), "items": store.all_entity_list_entries(_entity_list_name())}
+
+
+@app.get("/entity-lists.json")
+def entity_lists_json():
+    return jsonify(_entity_list_payload())
+
+
+@app.route("/entity-list/<kind>/<entity_id>", methods=["GET", "POST", "PUT", "DELETE"])
+def entity_list_item(kind, entity_id):
+    if not _valid_entity_list_kind(kind):
+        return jsonify({"error": "kind must be actor or studio"}), 400
+    entity_id = urllib.parse.unquote(entity_id)
+    title = request.values.get("title") or _entity_title_from_id(kind, entity_id)
+    if request.method == "DELETE":
+        enabled = False
+        store.set_entity_in_list(_entity_list_name(), kind, entity_id, title, False)
+    else:
+        enabled = True
+        store.set_entity_in_list(_entity_list_name(), kind, entity_id, title, True)
+    if "text/html" in (request.headers.get("Accept") or ""):
+        return redirect(request.referrer or "/entity-lists")
+    return jsonify({"list_name": _entity_list_name(), "kind": kind, "id": entity_id, "title": title, "listed": enabled})
+
+
+@app.get("/entity-list/<kind>/<entity_id>/toggle")
+def entity_list_toggle(kind, entity_id):
+    if not _valid_entity_list_kind(kind):
+        return jsonify({"error": "kind must be actor or studio"}), 400
+    entity_id = urllib.parse.unquote(entity_id)
+    title = request.args.get("title") or _entity_title_from_id(kind, entity_id)
+    enabled = store.toggle_entity_in_list(_entity_list_name(), kind, entity_id, title)
+    if "text/html" in (request.headers.get("Accept") or ""):
+        return redirect(request.referrer or "/entity-lists")
+    return jsonify({"list_name": _entity_list_name(), "kind": kind, "id": entity_id, "title": title, "listed": enabled})
+
+
+def _entity_list_html_rows(kind: str, entries: list, base_url: str) -> str:
+    rows = []
+    for entry in entries:
+        listed = bool(entry.get("in_list"))
+        title = html.escape(entry["title"])
+        count = int(entry.get("count") or 0)
+        mark = "★" if listed else "☆"
+        action = "Убрать" if listed else "Добавить"
+        cls = "listed" if listed else ""
+        url = html.escape(_entity_list_toggle_url(base_url, kind, entry["id"], entry["title"]), quote=True)
+        rows.append(
+            f'<tr class="{cls}"><td class="star">{mark}</td><td>{title}</td>'
+            f'<td class="count">{count}</td><td><a href="{url}">{action}</a></td></tr>'
+        )
+    return "\n".join(rows) or '<tr><td colspan="4">Пока пусто</td></tr>'
+
+
+@app.get("/entity-lists")
+def entity_lists_page():
+    base_url = _base_url()
+    items = _library_items()
+    actors = _playa_entity_entries("actor", items, "performers", base_url)
+    studios = _playa_entity_entries("studio", items, "studio", base_url)
+    q = (request.args.get("q") or "").strip().casefold()
+    if q:
+        actors = [e for e in actors if q in e["title"].casefold()]
+        studios = [e for e in studios if q in e["title"].casefold()]
+    actor_rows = _entity_list_html_rows("actor", actors, base_url)
+    studio_rows = _entity_list_html_rows("studio", studios, base_url)
+    query_value = html.escape(request.args.get("q") or "", quote=True)
+    page = f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>deovr-bridge entity lists</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111;color:#eee;margin:24px;}}
+a{{color:#8bd3ff}} .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:24px}}
+table{{width:100%;border-collapse:collapse;background:#1b1b1b;border-radius:12px;overflow:hidden}}
+th,td{{padding:10px 12px;border-bottom:1px solid #2a2a2a;text-align:left}} th{{background:#242424}}
+.star{{width:36px;color:#ffd35a;font-size:20px}} .count{{width:80px;color:#aaa}} tr.listed{{background:#24210f}}
+input{{padding:9px 12px;border-radius:8px;border:1px solid #444;background:#1b1b1b;color:#eee;min-width:280px}}
+button{{padding:9px 14px;border-radius:8px;border:0;background:#3662ff;color:white}}
+.help{{color:#bbb;max-width:960px;line-height:1.45}}
+</style></head><body>
+<h1>Локальный список актёров/студий</h1>
+<p class="help">PLAY'A не даёт documented write endpoint для избранного актёров/студий. Поэтому список хранится локально в deovr-bridge: отмеченные элементы поднимаются вверх и помечаются ★ в PLAY'A Actors/Studios. Нативное избранное видео PLAY'A не трогаем.</p>
+<form method="get"><input name="q" placeholder="Фильтр по имени" value="{query_value}"> <button>Найти</button> <a href="/entity-lists">Сброс</a></form>
+<div class="grid">
+<section><h2>Актёры</h2><table><thead><tr><th></th><th>Имя</th><th>Видео</th><th></th></tr></thead><tbody>{actor_rows}</tbody></table></section>
+<section><h2>Студии</h2><table><thead><tr><th></th><th>Название</th><th>Видео</th><th></th></tr></thead><tbody>{studio_rows}</tbody></table></section>
+</div></body></html>"""
+    return Response(page, mimetype="text/html; charset=utf-8")
 
 
 

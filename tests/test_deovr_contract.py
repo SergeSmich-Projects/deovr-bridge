@@ -282,12 +282,50 @@ class DeoVRContractTests(unittest.TestCase):
 
         actor_detail = client.get(f"/api/playa/v2/actor/{actor_id}", headers={"Host": "192.168.1.2:9999"}).get_json()
         prop_names = [prop["name"] for prop in actor_detail["data"]["properties"]]
-        self.assertEqual(prop_names, ["Videos"])
+        self.assertEqual(prop_names, ["Videos", "Local list"])
 
         studios = client.get("/api/playa/v2/studios", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertIn("/entity-placeholder/studio/", studios["data"]["content"][0]["preview"])
         self.assertIn(".png?", studios["data"]["content"][0]["preview"])
         self.assertNotIn("images.povr.com", studios["data"]["content"][0]["preview"])
+
+    def test_actor_and_studio_local_entity_list(self):
+        db_path = _temp_db(self)
+        app_mod, store_mod = _load_app_for_db(db_path)
+        store_mod.upsert_item(_sample_item(id="list_1", title="List sample"))
+
+        actor_id = app_mod._playa_entity_id("actor", "Actor One")
+        studio_id = app_mod._playa_entity_id("studio", "Studio A")
+        client = app_mod.app.test_client()
+
+        actor_toggle = client.get(
+            f"/entity-list/actor/{actor_id}/toggle?title=Actor%20One",
+            headers={"Host": "192.168.1.2:9999", "Accept": "application/json"},
+        ).get_json()
+        self.assertTrue(actor_toggle["listed"])
+        studio_toggle = client.post(
+            f"/entity-list/studio/{studio_id}",
+            data={"title": "Studio A"},
+            headers={"Host": "192.168.1.2:9999", "Accept": "application/json"},
+        ).get_json()
+        self.assertTrue(studio_toggle["listed"])
+
+        actors = client.get("/api/playa/v2/actors", headers={"Host": "192.168.1.2:9999"}).get_json()
+        self.assertEqual(actors["data"]["content"][0]["title"], "★ Actor One")
+        studios = client.get("/api/playa/v2/studios", headers={"Host": "192.168.1.2:9999"}).get_json()
+        self.assertEqual(studios["data"]["content"][0]["title"], "★ Studio A")
+
+        lists = client.get("/entity-lists.json", headers={"Host": "192.168.1.2:9999"}).get_json()
+        listed = {(row["kind"], row["entity_id"]) for row in lists["items"]}
+        self.assertIn(("actor", actor_id), listed)
+        self.assertIn(("studio", studio_id), listed)
+
+        client.delete(
+            f"/entity-list/actor/{actor_id}",
+            headers={"Host": "192.168.1.2:9999", "Accept": "application/json"},
+        )
+        actors = client.get("/api/playa/v2/actors", headers={"Host": "192.168.1.2:9999"}).get_json()
+        self.assertEqual(actors["data"]["content"][0]["title"], "Actor One")
 
 
 if __name__ == "__main__":

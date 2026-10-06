@@ -133,9 +133,16 @@ HIDDEN_LIBRARY_SITE_IDS=
 
 Для страниц Actors/Studios мост лениво пробует подтягивать публичные картинки:
 
-- актёры: `https://www.vrspy.com/stars` / `https://www.vrspy.com/star/<actor-slug>` → avatar/poster; старый POVR-кэш для актёров игнорируется, чтобы не показывать один и тот же чужой постер;
-- студии: сначала точное совпадение в `https://povr.com/studios` → PNG logo, затем detail `https://povr.com/studios/<studio-slug>` только если страница точно совпала со студией; старый кэш студий автоматически пересобирается, чтобы убрать ошибочно подобранные чужие логотипы;
+- если задан `STASHBOX_METADATA_PROVIDERS`, сначала пробует структурированные Stash-Box endpoints (например ThePornDB/StashDB) и берёт `images` у performer/studio;
+- актёры: публичный fallback `https://www.vrspy.com/stars` / `https://www.vrspy.com/star/<actor-slug>` → avatar/poster; старый POVR-кэш для актёров игнорируется, чтобы не показывать один и тот же чужой постер;
+- студии: публичный fallback сначала ищет точное совпадение в `https://povr.com/studios` → PNG logo, затем detail `https://povr.com/studios/<studio-slug>` только если страница точно совпала со студией; старый кэш студий автоматически пересобирается, чтобы убрать ошибочно подобранные чужие логотипы;
 - если на странице удаётся найти трейлер одного из роликов, его URL сохраняется только как служебная ссылка в debug/metadata.
+
+Stash-Box provider включается так (ключи хранить только локально, не коммитить):
+
+```bash
+STASHBOX_METADATA_PROVIDERS="https://theporndb.net/graphql|TPDB_API_KEY;https://stashdb.org/graphql|STASHDB_API_KEY"
+```
 
 Списки Actors/Studios больше не ждут сетевых lookup'ов синхронно: сначала быстро отдаются названия с PNG-заглушками, а недостающие URL обновляются в фоне и попадают в `cache.sqlite3` для следующего refresh в PLAY'A. Кэшируются только URL и текстовые метаданные, сами изображения/видео не сохраняются в БД.
 Отключить внешний lookup можно так:
@@ -144,8 +151,19 @@ HIDDEN_LIBRARY_SITE_IDS=
 ENABLE_EXTERNAL_ENTITY_META=0
 ```
 
-Правая панель PLAY'A сейчас отдаёт только группу `Tags` с обычными категориями/тегами. Избранное не
-дублируется на стороне моста: используем нативное избранное PLAY'A.
+Правая панель PLAY'A сейчас отдаёт только группу `Tags` с обычными категориями/тегами. Нативное
+избранное видео PLAY'A не дублируется на стороне моста.
+
+Для актёров/студий, где у PLAY'A нет documented write-favorites endpoint, есть локальный список:
+
+```text
+GET /entity-lists          # простая web-страница с кнопками добавить/убрать
+GET /entity-lists.json     # JSON содержимого списка
+GET /entity-list/<actor|studio>/<id>/toggle?title=<title>
+POST/DELETE /entity-list/<actor|studio>/<id>
+```
+
+Отмеченные актёры/студии поднимаются вверх в PLAY'A Actors/Studios и получают префикс `★`.
 
 Карточки PLAY'A: крупная строка — студия, мелкая строка — актёры. Сиды/пиры, разрешение и короткая
 дата (`06.10.26`) убраны из видимого текста карточки и отдаются только как вспомогательные `tooltip` /
