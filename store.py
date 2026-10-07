@@ -182,6 +182,42 @@ def init_db():
             "ON entity_aliases(kind, canonical_title)"
         )
 
+        # Кэш внешних PLAY'A trailer-карточек. Подписанные ссылки на mp4 сюда
+        # намеренно не пишем: они короткоживущие и обновляются при открытии video.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_scenes (
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                title TEXT,
+                subtitle TEXT,
+                preview_url TEXT,
+                release_date INTEGER,
+                trailer_duration INTEGER,
+                actor_keys TEXT DEFAULT '[]',
+                actor_titles TEXT DEFAULT '[]',
+                studio_id TEXT DEFAULT '',
+                studio_title TEXT DEFAULT '',
+                updated_at INTEGER,
+                PRIMARY KEY (provider, external_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_external_scenes_updated ON external_scenes(updated_at)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_entity_refs (
+                provider TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                alias_key TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                title TEXT,
+                updated_at INTEGER,
+                PRIMARY KEY (provider, kind, alias_key)
+            )
+            """
+        )
+
         _db_initialized = True
         _db_initialized_path = config.DB_PATH
 
@@ -514,6 +550,101 @@ def all_entity_aliases(kind: str = None) -> list:
     sql += " ORDER BY kind, canonical_title COLLATE NOCASE, alias COLLATE NOCASE"
     with _lock, _conn() as conn:
         return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+
+def upsert_external_entity_ref(provider: str, kind: str, alias_key: str,
+                               external_id: str, title: str = ""):
+    ensure_db()
+    with _lock, _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO external_entity_refs
+                (provider, kind, alias_key, external_id, title, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, kind, alias_key) DO UPDATE SET
+                external_id=excluded.external_id,
+                title=excluded.title,
+                updated_at=excluded.updated_at
+            """,
+            (provider, kind, alias_key, str(external_id), title or "", int(time.time())),
+        )
+
+
+def get_external_entity_ref(provider: str, kind: str, alias_key: str):
+    ensure_db()
+    with _lock, _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM external_entity_refs WHERE provider=? AND kind=? AND alias_key=?",
+            (provider, kind, alias_key),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_external_scene(scene: dict):
+    ensure_db()
+    with _lock, _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO external_scenes
+                (provider, external_id, title, subtitle, preview_url, release_date,
+                 trailer_duration, actor_keys, actor_titles, studio_id, studio_title, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, external_id) DO UPDATE SET
+                title=excluded.title,
+                subtitle=excluded.subtitle,
+                preview_url=excluded.preview_url,
+                release_date=excluded.release_date,
+                trailer_duration=excluded.trailer_duration,
+                actor_keys=excluded.actor_keys,
+                actor_titles=excluded.actor_titles,
+                studio_id=excluded.studio_id,
+                studio_title=excluded.studio_title,
+                updated_at=excluded.updated_at
+            """,
+            (
+                scene["provider"], str(scene["external_id"]), scene.get("title", ""),
+                scene.get("subtitle", ""), scene.get("preview_url", ""),
+                _optional_int(scene.get("release_date")), _optional_int(scene.get("trailer_duration")),
+                json.dumps(scene.get("actor_keys", []), ensure_ascii=False),
+                json.dumps(scene.get("actor_titles", []), ensure_ascii=False),
+                str(scene.get("studio_id") or ""), scene.get("studio_title", ""), int(time.time()),
+            ),
+        )
+
+
+def external_scenes_for_actor(actor_key: str, provider: str = None) -> list:
+    ensure_db()
+    with _lock, _conn() as conn:
+        if provider:
+            rows = conn.execute(
+                "SELECT * FROM external_scenes WHERE provider=? ORDER BY release_date DESC",
+                (provider,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM external_scenes ORDER BY release_date DESC").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["actor_keys"] = _json_list(item.get("actor_keys"))
+            item["actor_titles"] = _json_list(item.get("actor_titles"))
+            if actor_key in item["actor_keys"]:
+                result.append(item)
+        return result
+
+
+def get_external_scene(provider: str, external_id: str):
+    ensure_db()
+    with _lock, _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM external_scenes WHERE provider=? AND external_id=?",
+            (provider, str(external_id)),
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["actor_keys"] = _json_list(item.get("actor_keys"))
+        item["actor_titles"] = _json_list(item.get("actor_titles"))
+        return item
 
 
 def get_crawl_state(section_url: str) -> dict:

@@ -201,6 +201,10 @@ EXTERNAL_ENTITY_META_TIMEOUT_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TIME
 POVR_BASE_URL = os.environ.get("POVR_BASE_URL", "https://povr.com")
 VRSPY_BASE_URL = os.environ.get("VRSPY_BASE_URL", "https://www.vrspy.com")
 VRPORN_BASE_URL = os.environ.get("VRPORN_BASE_URL", "https://vrporn.com")
+# Трейлерные карточки внешних PLAY'A-каталогов. Списки сцен кэшируются локально,
+# но подписанные media URL всегда запрашиваются заново при открытии карточки.
+ENABLE_EXTERNAL_TRAILERS = os.environ.get("ENABLE_EXTERNAL_TRAILERS", "1").lower() not in ("0", "false", "no")
+EXTERNAL_TRAILER_CATALOG_TTL_SEC = int(os.environ.get("EXTERNAL_TRAILER_CATALOG_TTL_SEC", str(24 * 3600)))
 # Опциональные структурированные metadata-провайдеры Stash-Box (например,
 # ThePornDB/StashDB). Формат env:
 # STASHBOX_METADATA_PROVIDERS="https://theporndb.net/graphql|API_KEY;https://stashdb.org/graphql|API_KEY"

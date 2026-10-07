@@ -21,6 +21,7 @@ def _load_app_for_db(db_path: str, hidden_sites: str = "xxxclub"):
     os.environ["REFRESH_INTERVAL_SEC"] = "0"
     os.environ["HIDDEN_LIBRARY_SITE_IDS"] = hidden_sites
     os.environ["ENABLE_EXTERNAL_ENTITY_META"] = "0"
+    os.environ["ENABLE_EXTERNAL_TRAILERS"] = "0"
     _drop_project_modules()
     import app  # noqa: PLC0415
     import store  # noqa: PLC0415
@@ -370,6 +371,54 @@ class DeoVRContractTests(unittest.TestCase):
         )
         hidden_detail = client.get("/api/playa/v2/video/xc_1", headers=common_headers).get_json()
         self.assertEqual(hidden_detail["status"]["code"], 1)
+
+    def test_external_actor_trailers_are_listed_and_playable(self):
+        db_path = _temp_db(self)
+        app_mod, store_mod = _load_app_for_db(db_path)
+        store_mod.upsert_item(_sample_item(performers=["Blake Blossom"]))
+        app_mod.config.ENABLE_EXTERNAL_TRAILERS = True
+
+        def fake_get_json(url, headers=None):
+            if "/actors?" in url:
+                return {"status": {"code": 1}, "data": {"content": [
+                    {"id": "blake-blossom", "title": "Blake Blossom", "preview": "https://cdn/actor.jpg"}
+                ]}}
+            if "/videos?" in url:
+                return {"status": {"code": 1}, "data": {
+                    "page_total": 1,
+                    "content": [{
+                        "id": "8544", "title": "Trailer scene", "subtitle": "RealJamVR",
+                        "preview_image": "https://cdn/poster.jpg", "release_date": 1600000000,
+                        "details": [{"type": "trailer", "duration_seconds": 73}, {"type": "full", "duration_seconds": 3200}],
+                    }],
+                }}
+            if "/video/8544" in url:
+                return {"status": {"code": 1}, "data": {
+                    "id": "8544", "title": "Trailer scene", "preview_image": "https://cdn/poster.jpg",
+                    "details": [
+                        {"type": "trailer", "duration_seconds": 73, "links": [
+                            {"is_stream": True, "url": "https://cdn/trailer.mp4", "projection": "180", "stereo": "LR"}
+                        ]},
+                        {"type": "full", "duration_seconds": 3200, "links": [
+                            {"is_stream": True, "url": "https://cdn/premium.mp4"}
+                        ]},
+                    ],
+                    "actors": [{"id": "blake-blossom", "title": "Blake Blossom"}],
+                }}
+            raise AssertionError(url)
+
+        app_mod._external_get_json = fake_get_json
+        client = app_mod.app.test_client()
+        headers = {"Host": "192.168.1.2:9999"}
+        actors = client.get("/api/playa/v2/actors", headers=headers).get_json()
+        actor_id = actors["data"]["content"][0]["id"]
+        videos = client.get(f"/api/playa/v2/videos?actor={actor_id}&page-size=20", headers=headers).get_json()
+        trailer = next(row for row in videos["data"]["content"] if row["id"] == "trailer__vrporn__8544")
+        self.assertEqual(trailer["details"][0]["duration_seconds"], 73)
+
+        detail = client.get("/api/playa/v2/video/trailer__vrporn__8544", headers=headers).get_json()["data"]
+        self.assertEqual([row["type"] for row in detail["details"]], ["trailer"])
+        self.assertEqual(detail["details"][0]["links"][0]["url"], "https://cdn/trailer.mp4")
 
     def test_vrporn_playa_metadata_provider_uses_playa_preview_fields(self):
         db_path = _temp_db(self)

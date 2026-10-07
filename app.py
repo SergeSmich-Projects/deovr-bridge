@@ -1253,6 +1253,152 @@ def _fetch_vrporn_playa_studio_directory_map() -> dict:
 
 
 
+_EXTERNAL_VIDEO_ID_RE = re.compile(r"^trailer__([a-z0-9_-]+)__(.+)$")
+
+
+def _external_video_id(provider: str, external_id) -> str:
+    return f"trailer__{provider}__{external_id}"
+
+
+def _parse_external_video_id(item_id: str):
+    match = _EXTERNAL_VIDEO_ID_RE.match(item_id or "")
+    return match.groups() if match else None
+
+
+def _trailer_duration(details: list) -> int:
+    for detail in details or []:
+        if (detail.get("type") or "").casefold() == "trailer":
+            return int(detail.get("duration_seconds") or 0)
+    return 0
+
+
+def _find_vrporn_actor(title: str) -> dict:
+    url = _playa_api_url(
+        config.VRPORN_BASE_URL.rstrip("/"), "/api/playa/v2/actors",
+        {"title": title, "page-size": 8},
+    )
+    return _best_playa_list_match(_playa_page_content(_external_get_json(url)), title)
+
+
+def _refresh_vrporn_actor_trailers(title: str) -> list:
+    actor = _find_vrporn_actor(title)
+    if not actor or not _entity_values_match("actor", actor.get("title") or "", title):
+        return []
+    actor_id = str(actor.get("id") or "")
+    if not actor_id:
+        return []
+    actor_key = _entity_alias_key(_canonical_entity_title("actor", title))
+    store.upsert_external_entity_ref("vrporn", "actor", actor_key, actor_id, actor.get("title") or title)
+
+    page_index = 0
+    while page_index < 100:
+        url = _playa_api_url(
+            config.VRPORN_BASE_URL.rstrip("/"), "/api/playa/v2/videos",
+            {"actor": actor_id, "page-index": page_index, "page-size": 100},
+        )
+        payload = _external_get_json(url)
+        content = _playa_page_content(payload)
+        data = payload.get("data") or {}
+        for row in content:
+            duration = _trailer_duration(row.get("details") or [])
+            if not duration:
+                continue
+            external_id = str(row.get("id") or "")
+            if not external_id:
+                continue
+            existing = store.get_external_scene("vrporn", external_id) or {}
+            actor_keys = list(dict.fromkeys((existing.get("actor_keys") or []) + [actor_key]))
+            actor_titles = list(dict.fromkeys(
+                (existing.get("actor_titles") or []) + [actor.get("title") or title]
+            ))
+            store.upsert_external_scene({
+                "provider": "vrporn",
+                "external_id": external_id,
+                "title": row.get("title") or "",
+                "subtitle": row.get("subtitle") or "",
+                "preview_url": row.get("preview_image") or "",
+                "release_date": row.get("release_date"),
+                "trailer_duration": duration,
+                "actor_keys": actor_keys,
+                "actor_titles": actor_titles,
+                "studio_title": row.get("subtitle") or "",
+            })
+        page_total = int(data.get("page_total") or 1)
+        page_index += 1
+        if not content or page_index >= page_total:
+            break
+    return store.external_scenes_for_actor(actor_key, "vrporn")
+
+
+def _external_trailer_scenes_for_actor(title: str) -> list:
+    if not config.ENABLE_EXTERNAL_TRAILERS:
+        return []
+    actor_key = _entity_alias_key(_canonical_entity_title("actor", title))
+    ref = store.get_external_entity_ref("vrporn", "actor", actor_key)
+    stale = not ref or int(time.time()) - int(ref.get("updated_at") or 0) >= config.EXTERNAL_TRAILER_CATALOG_TTL_SEC
+    if stale:
+        try:
+            return _refresh_vrporn_actor_trailers(title)
+        except Exception as e:
+            log.info("Не удалось обновить VRPorn trailers actor %r: %s", title, e)
+    return store.external_scenes_for_actor(actor_key, "vrporn")
+
+
+def _external_trailer_list_view(scene: dict) -> dict:
+    studio = scene.get("studio_title") or scene.get("subtitle") or scene.get("provider", "").upper()
+    return {
+        "id": _external_video_id(scene["provider"], scene["external_id"]),
+        "title": scene.get("title") or "Trailer",
+        "subtitle": f"Trailer · {studio}",
+        "preview_image": scene.get("preview_url") or "",
+        "release_date": int(scene.get("release_date") or 0),
+        "has_scripts": False,
+        "details": [{
+            "type": "trailer",
+            "duration_seconds": int(scene.get("trailer_duration") or 0),
+            "transparency_mode": 0,
+            "has_scripts": False,
+        }],
+    }
+
+
+def _external_trailer_video_view(provider: str, external_id: str) -> dict:
+    if provider != "vrporn":
+        return {}
+    url = _playa_api_url(
+        config.VRPORN_BASE_URL.rstrip("/"),
+        f"/api/playa/v2/video/{urllib.parse.quote(str(external_id), safe='')}",
+    )
+    payload = _external_get_json(url)
+    if not _playa_payload_ok(payload):
+        return {}
+    data = payload.get("data") or {}
+    trailer_details = []
+    for detail in data.get("details") or []:
+        if (detail.get("type") or "").casefold() != "trailer":
+            continue
+        links = [link for link in detail.get("links") or [] if link.get("url") and link.get("is_stream", True)]
+        if not links:
+            continue
+        clean = dict(detail)
+        clean["links"] = links
+        trailer_details.append(clean)
+    if not trailer_details:
+        return {}
+    actors = []
+    for actor in data.get("actors") or []:
+        title = _canonical_entity_title("actor", actor.get("title") or "")
+        actors.append({"id": _playa_entity_id("actor", title), "title": title, "preview": actor.get("preview")})
+    result = dict(data)
+    result["id"] = _external_video_id(provider, external_id)
+    result["details"] = trailer_details
+    result["actors"] = actors
+    result["has_scripts"] = False
+    # Полный premium detail внешнего сайта не проксируем: эта карточка именно трейлер.
+    return result
+
+
+
 def _fetch_vrporn_playa_entity_meta(kind: str, title: str) -> dict:
     """Берём artwork напрямую из PLAY'A API VRPorn.com.
 
@@ -2206,14 +2352,38 @@ def playa_videos():
     # Общая лента по-прежнему не показывает скрытые источники (например,
     # XXXClub), но actor/studio drill-down ищет по всему локальному индексу.
     has_entity_filter = bool((_playa_arg("actor") or "").strip() or (_playa_arg("studio") or "").strip())
-    items = _playa_filter_videos(_catalog_items() if has_entity_filter else _library_items())
-    page_index, page_size = _playa_page_args()
+    source_items = _catalog_items() if has_entity_filter else _library_items()
+    items = _playa_filter_videos(source_items)
     content = [_playa_list_view(item, base_url) for item in items]
+
+    # Внешние PLAY'A-сайты показывают на actor page trailer-карточки. Сохраняем
+    # такое же поведение: локальные полные раздачи идут первыми, затем доступные
+    # трейлеры; media URL трейлера будет получен свежим только при открытии video.
+    actor_id = (_playa_arg("actor") or "").strip()
+    if actor_id:
+        actor_name = _playa_collect_entities(_catalog_items())["actors"].get(actor_id)
+        if actor_name:
+            title_filter = (_playa_arg("title") or "").strip().casefold()
+            trailers = _external_trailer_scenes_for_actor(actor_name)
+            if title_filter:
+                trailers = [scene for scene in trailers if title_filter in (scene.get("title") or "").casefold()]
+            content.extend(_external_trailer_list_view(scene) for scene in trailers)
+
+    page_index, page_size = _playa_page_args()
     return _playa_response(_playa_page(content, page_index, page_size))
 
 
 @app.get(f"{_PLAYA_PREFIX}/video/<item_id>")
 def playa_video_detail(item_id):
+    external = _parse_external_video_id(item_id)
+    if external:
+        try:
+            view = _external_trailer_video_view(*external)
+        except Exception as e:
+            log.info("Не удалось получить trailer video %s: %s", item_id, e)
+            view = {}
+        return _playa_response(view) if view else _playa_not_found("Trailer not found")
+
     # PLAY'A может прийти сюда из actor/studio matching-выдачи скрытого источника.
     item = store.get_item(item_id)
     if not item:
