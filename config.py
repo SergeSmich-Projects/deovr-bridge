@@ -224,6 +224,25 @@ for _raw_provider in os.environ.get("STASHBOX_METADATA_PROVIDERS", "").split(";"
 # Локальный список актёров/студий (web UI + звёздочки/сортировка в PLAY'A).
 ENTITY_LIST_DEFAULT_NAME = os.environ.get("ENTITY_LIST_DEFAULT_NAME", "watchlist")
 
+# Публичный Knaben API используется как дополнительный meta-index: берём только
+# VR-похожие magnet/infohash с недавним lastSeen, реальными S>=2 и разумным
+# размером. Запросы разделяются точкой с запятой, чтобы названия могли содержать
+# обычные пробелы и запятые.
+ENABLE_KNABEN = os.environ.get("ENABLE_KNABEN", "1").lower() not in ("0", "false", "no")
+KNABEN_API_URL = os.environ.get("KNABEN_API_URL", "https://api.knaben.org/v1")
+KNABEN_QUERIES = [
+    value.strip()
+    for value in os.environ.get("KNABEN_QUERIES", "VR180").split(";")
+    if value.strip()
+]
+KNABEN_RESULTS_PER_QUERY = int(os.environ.get("KNABEN_RESULTS_PER_QUERY", "150"))
+KNABEN_MAX_IMPORT_ITEMS = int(os.environ.get("KNABEN_MAX_IMPORT_ITEMS", "150"))
+KNABEN_MIN_SEEDERS = int(os.environ.get("KNABEN_MIN_SEEDERS", "2"))
+KNABEN_MIN_SIZE_BYTES = int(os.environ.get("KNABEN_MIN_SIZE_BYTES", str(1024 ** 3)))
+KNABEN_MAX_SIZE_BYTES = int(os.environ.get("KNABEN_MAX_SIZE_BYTES", str(500 * 1024 ** 3)))
+KNABEN_LAST_SEEN_SEC = int(os.environ.get("KNABEN_LAST_SEEN_SEC", str(30 * 24 * 3600)))
+KNABEN_TIMEOUT_SEC = int(os.environ.get("KNABEN_TIMEOUT_SEC", "20"))
+
 REFRESH_INTERVAL_SEC = int(os.environ.get("REFRESH_INTERVAL_SEC", "3600"))
 
 # Сколько секунд переиспользовать уже полученный у TorrServe stream_url, не
@@ -356,5 +375,13 @@ FORUM_SITES = [
         "engine": "xxxclub",        # отдельный движок - обходится по-другому,
                                      # см. scraper._refresh_site_xxxclub()
         "impersonate": None,        # антибота нет - обычный requests, без curl_cffi
+    },
+    {
+        "id": "knaben",
+        "name": "Knaben",
+        "base_url": KNABEN_API_URL,
+        "engine": "knaben",
+        "cookie_file": "",
+        "id_prefix": "kn_",
     },
 ]

@@ -309,7 +309,7 @@ def upsert_item(item: dict):
                 "stereo_mode": item.get("stereo_mode", config.DEFAULT_STEREO_MODE),
                 "video_length": item.get("video_length", 0),
                 "video_height": _optional_int(item.get("video_height")),
-                "created_at": int(time.time()),
+                "created_at": _optional_int(item.get("created_at")) or int(time.time()),
                 "updated_at": int(time.time()),
                 "performers": json.dumps(item.get("performers", []), ensure_ascii=False),
                 "studio": json.dumps(item.get("studio", []), ensure_ascii=False),
