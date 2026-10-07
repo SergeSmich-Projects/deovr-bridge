@@ -2023,16 +2023,16 @@ def _playa_video_link(item: dict, base_url: str) -> dict:
 
 
 def _playa_list_view(item: dict, base_url: str) -> dict:
+    info_line = _playa_info_line(item)
     return {
         "id": str(item["id"]),
-        "title": _playa_studio_line(item),
-        "subtitle": _playa_subtitle(item),
+        # Две доступные PLAY'A строки используем плотнее: студия и актёры вместе
+        # сверху, техническая информация — отдельной видимой строкой снизу.
+        "title": _playa_people_line(item),
+        "subtitle": info_line,
         "status": "FULL",
-        # PLAY'A API v2 has no documented CSS/hover field for list cards. Keep the
-        # seed/peer/resolution/date string off the visible card and expose it as
-        # auxiliary metadata for clients that tolerate/read non-standard fields.
-        "tooltip": _playa_info_line(item),
-        "description": _playa_info_line(item),
+        "tooltip": info_line,
+        "description": info_line,
         "preview_image": _image_url(item, base_url),
         "has_scripts": False,
         "release_date": int(item.get("created_at") or item.get("updated_at") or 0),

@@ -211,11 +211,12 @@ class DeoVRContractTests(unittest.TestCase):
         card = videos["data"]["content"][0]
         self.assertEqual(card["status"], "FULL")
         self.assertIn("Studio A", card["title"])
-        self.assertIn("Actor One", card["subtitle"])
-        self.assertNotIn("S7", card["subtitle"])
-        self.assertIn("S7", card["tooltip"])
-        self.assertIn("P2", card["tooltip"])
-        self.assertIn("3072p", card["tooltip"])
+        self.assertIn("Actor One", card["title"])
+        self.assertIn("S7", card["subtitle"])
+        self.assertIn("P2", card["subtitle"])
+        self.assertIn("3072p", card["subtitle"])
+        self.assertRegex(card["subtitle"], r"\d{2}\.\d{2}\.\d{2}")
+        self.assertEqual(card["tooltip"], card["subtitle"])
 
         detail = client.get("/api/playa/v2/video/pl_42", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertEqual(detail["status"]["code"], 1)
