@@ -206,6 +206,19 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_external_scenes_updated ON external_scenes(updated_at)")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS external_scene_matches (
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                score INTEGER,
+                updated_at INTEGER,
+                PRIMARY KEY (provider, external_id, item_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_external_matches_item ON external_scene_matches(item_id)")
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS external_entity_refs (
                 provider TEXT NOT NULL,
                 kind TEXT NOT NULL,
@@ -645,6 +658,51 @@ def get_external_scene(provider: str, external_id: str):
         item["actor_keys"] = _json_list(item.get("actor_keys"))
         item["actor_titles"] = _json_list(item.get("actor_titles"))
         return item
+
+
+def save_external_scene_match(provider: str, external_id: str, item_id: str, score: int):
+    ensure_db()
+    with _lock, _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO external_scene_matches (provider, external_id, item_id, score, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(provider, external_id, item_id) DO UPDATE SET
+                score=excluded.score, updated_at=excluded.updated_at
+            """,
+            (provider, str(external_id), item_id, int(score), int(time.time())),
+        )
+
+
+def external_scene_matches(provider: str, external_id: str) -> list:
+    ensure_db()
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.*, i.title AS item_title, i.video_height, i.seeders, i.site
+            FROM external_scene_matches m
+            JOIN items i ON i.id = m.item_id
+            WHERE m.provider=? AND m.external_id=?
+            ORDER BY m.score DESC, COALESCE(i.seeders, 0) DESC, COALESCE(i.video_height, 0) DESC
+            """,
+            (provider, str(external_id)),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def external_matches_for_item(item_id: str) -> list:
+    ensure_db()
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.*, s.title, s.subtitle, s.preview_url, s.trailer_duration
+            FROM external_scene_matches m
+            JOIN external_scenes s ON s.provider=m.provider AND s.external_id=m.external_id
+            WHERE m.item_id=? ORDER BY m.score DESC, s.release_date DESC
+            """,
+            (item_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def get_crawl_state(section_url: str) -> dict:

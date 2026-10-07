@@ -209,7 +209,7 @@ class DeoVRContractTests(unittest.TestCase):
         self.assertEqual(videos["status"]["code"], 1)
         self.assertEqual(videos["data"]["item_total"], 1)
         card = videos["data"]["content"][0]
-        self.assertEqual(card["status"], "")
+        self.assertEqual(card["status"], "FULL")
         self.assertIn("Studio A", card["title"])
         self.assertIn("Actor One", card["subtitle"])
         self.assertNotIn("S7", card["subtitle"])
@@ -248,7 +248,7 @@ class DeoVRContractTests(unittest.TestCase):
         self.assertTrue(any(category["title"] == "VR" for category in categories["data"]))
 
         groups = client.get("/api/playa/v2/categories-groups", headers={"Host": "192.168.1.2:9999"}).get_json()
-        self.assertEqual([g["id"] for g in groups["data"]], ["tags"])
+        self.assertEqual([g["id"] for g in groups["data"]], ["content_type", "tags"])
         statuses = client.get("/api/playa/v2/video-statuses", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertEqual(statuses["data"], [])
 
@@ -375,7 +375,7 @@ class DeoVRContractTests(unittest.TestCase):
     def test_external_actor_trailers_are_listed_and_playable(self):
         db_path = _temp_db(self)
         app_mod, store_mod = _load_app_for_db(db_path)
-        store_mod.upsert_item(_sample_item(performers=["Blake Blossom"]))
+        store_mod.upsert_item(_sample_item(title="Trailer scene", performers=["Blake Blossom"]))
         app_mod.config.ENABLE_EXTERNAL_TRAILERS = True
 
         def fake_get_json(url, headers=None):
@@ -417,8 +417,25 @@ class DeoVRContractTests(unittest.TestCase):
         self.assertEqual(trailer["details"][0]["duration_seconds"], 73)
 
         detail = client.get("/api/playa/v2/video/trailer__vrporn__8544", headers=headers).get_json()["data"]
-        self.assertEqual([row["type"] for row in detail["details"]], ["trailer"])
+        self.assertEqual([row["type"] for row in detail["details"]], ["trailer", "full"])
         self.assertEqual(detail["details"][0]["links"][0]["url"], "https://cdn/trailer.mp4")
+        self.assertEqual(detail["details"][1]["links"][0]["url"], "http://192.168.1.2:9999/stream/custom_42")
+        self.assertEqual(detail["counterpart_full_ids"], ["custom_42"])
+
+        full_detail = client.get("/api/playa/v2/video/custom_42", headers=headers).get_json()["data"]
+        self.assertEqual([row["type"] for row in full_detail["details"]], ["trailer", "full"])
+        self.assertEqual(full_detail["counterpart_trailer_id"], "trailer__vrporn__8544")
+
+        only_full = client.get(
+            f"/api/playa/v2/videos?actor={actor_id}&included-categories=content_full&page-size=20",
+            headers=headers,
+        ).get_json()["data"]["content"]
+        self.assertEqual([row["id"] for row in only_full], ["custom_42"])
+        only_trailers = client.get(
+            f"/api/playa/v2/videos?actor={actor_id}&included-categories=content_trailer&page-size=20",
+            headers=headers,
+        ).get_json()["data"]["content"]
+        self.assertEqual([row["id"] for row in only_trailers], ["trailer__vrporn__8544"])
 
     def test_vrporn_playa_metadata_provider_uses_playa_preview_fields(self):
         db_path = _temp_db(self)

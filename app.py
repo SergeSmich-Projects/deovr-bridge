@@ -19,6 +19,7 @@ Flask-сервер - "мост" между форумом, TorrServe и DeoVR.
 """
 
 import base64
+import difflib
 import hashlib
 import html
 import json
@@ -796,6 +797,8 @@ def heresphere_video(item_id):
 # затем /config и /videos. Аутентификацию отключаем (auth=false), чтобы мост
 # работал как локальная гостевая библиотека без JWT/логина.
 _PLAYA_PREFIX = "/api/playa/v2"
+_CONTENT_FULL_CATEGORY_ID = "content_full"
+_CONTENT_TRAILER_CATEGORY_ID = "content_trailer"
 
 _PLAYA_PROJECTION = {
     "flat": "FLT",
@@ -1344,12 +1347,48 @@ def _external_trailer_scenes_for_actor(title: str) -> list:
     return store.external_scenes_for_actor(actor_key, "vrporn")
 
 
+def _scene_match_score(scene: dict, item: dict) -> int:
+    scene_key = _entity_alias_key(scene.get("title") or "")
+    item_key = _entity_alias_key(item.get("title") or "")
+    if not scene_key or not item_key:
+        return 0
+    if len(scene_key) >= 8 and scene_key in item_key:
+        score = 65
+    else:
+        score = int(difflib.SequenceMatcher(None, scene_key, item_key).ratio() * 55)
+    scene_actor_keys = set(scene.get("actor_keys") or [])
+    item_actor_keys = {
+        _entity_alias_key(_canonical_entity_title("actor", title))
+        for title in item.get("performers", []) if title
+    }
+    if scene_actor_keys & item_actor_keys:
+        score += 20
+    scene_studio = _entity_alias_key(scene.get("studio_title") or scene.get("subtitle") or "")
+    item_studios = {_entity_alias_key(title) for title in item.get("studio", []) if title}
+    if scene_studio and scene_studio in item_studios:
+        score += 15
+    return min(score, 100)
+
+
+def _match_external_scenes_to_items(scenes: list, items: list):
+    for scene in scenes:
+        for item in items:
+            score = _scene_match_score(scene, item)
+            if score >= 70:
+                store.save_external_scene_match(
+                    scene["provider"], scene["external_id"], str(item["id"]), score,
+                )
+
+
 def _external_trailer_list_view(scene: dict) -> dict:
     studio = scene.get("studio_title") or scene.get("subtitle") or scene.get("provider", "").upper()
+    matches = store.external_scene_matches(scene["provider"], scene["external_id"])
+    status = "TRAILER + FULL" if matches else "TRAILER"
     return {
         "id": _external_video_id(scene["provider"], scene["external_id"]),
         "title": scene.get("title") or "Trailer",
         "subtitle": f"Trailer · {studio}",
+        "status": status,
         "preview_image": scene.get("preview_url") or "",
         "release_date": int(scene.get("release_date") or 0),
         "has_scripts": False,
@@ -1362,7 +1401,7 @@ def _external_trailer_list_view(scene: dict) -> dict:
     }
 
 
-def _external_trailer_video_view(provider: str, external_id: str) -> dict:
+def _external_trailer_video_view(provider: str, external_id: str, base_url: str = None) -> dict:
     if provider != "vrporn":
         return {}
     url = _playa_api_url(
@@ -1394,7 +1433,31 @@ def _external_trailer_video_view(provider: str, external_id: str) -> dict:
     result["details"] = trailer_details
     result["actors"] = actors
     result["has_scripts"] = False
-    # Полный premium detail внешнего сайта не проксируем: эта карточка именно трейлер.
+
+    # Если сцена уже сопоставлена с торрентом, та же карточка получает официальный
+    # PLAY'A detail type=full. Это нативная воспроизводимая «ссылка на полное видео».
+    matched_ids = []
+    full_links = []
+    full_duration = 0
+    if base_url:
+        for match in store.external_scene_matches(provider, external_id):
+            item = store.get_item(match["item_id"])
+            if not item:
+                continue
+            matched_ids.append(str(item["id"]))
+            full_links.append(_playa_video_link(item, base_url))
+            full_duration = max(full_duration, int(item.get("video_length") or 0))
+    if full_links:
+        result["details"].append({
+            "type": "full",
+            "duration_seconds": full_duration,
+            "links": full_links,
+        })
+        result["status"] = "TRAILER + FULL"
+        result["counterpart_full_ids"] = matched_ids
+    else:
+        result["status"] = "TRAILER"
+    # Premium URL внешнего сайта не проксируем; full ведёт только на локальный TorrServe.
     return result
 
 
@@ -1964,7 +2027,7 @@ def _playa_list_view(item: dict, base_url: str) -> dict:
         "id": str(item["id"]),
         "title": _playa_studio_line(item),
         "subtitle": _playa_subtitle(item),
-        "status": _playa_status(item),
+        "status": "FULL",
         # PLAY'A API v2 has no documented CSS/hover field for list cards. Keep the
         # seed/peer/resolution/date string off the visible card and expose it as
         # auxiliary metadata for clients that tolerate/read non-standard fields.
@@ -2009,11 +2072,11 @@ def _playa_studio_ref(item: dict):
 
 def _playa_video_view(item: dict, base_url: str) -> dict:
     item_id = str(item["id"])
-    return {
+    result = {
         "id": item_id,
         "title": item["title"],
         "subtitle": _playa_subtitle(item),
-        "status": _playa_status(item),
+        "status": "FULL",
         "description": _playa_description(item),
         "preview_image": _image_url(item, base_url),
         "release_date": int(item.get("created_at") or item.get("updated_at") or 0),
@@ -2038,6 +2101,24 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
             }
         ],
     }
+    # Обратная связь: у полной torrent-карточки показываем trailer detail
+    # сопоставленной внешней сцены. URL обновляется в момент открытия карточки.
+    if config.ENABLE_EXTERNAL_TRAILERS:
+        for match in store.external_matches_for_item(item_id)[:1]:
+            try:
+                external = _external_trailer_video_view(
+                    match["provider"], match["external_id"], base_url=None,
+                )
+            except Exception as e:
+                log.info("Не удалось получить связанный trailer для %s: %s", item_id, e)
+                external = {}
+            trailers = [detail for detail in external.get("details", []) if detail.get("type") == "trailer"]
+            if trailers:
+                result["details"] = trailers + result["details"]
+                result["status"] = "FULL + TRAILER"
+                result["counterpart_trailer_id"] = _external_video_id(match["provider"], match["external_id"])
+                break
+    return result
 
 
 def _playa_page_args(default_size: int = 60) -> tuple:
@@ -2108,6 +2189,12 @@ def _playa_filter_videos(items: list) -> list:
     studio_id = (_playa_arg("studio") or "").strip()
     included_categories = _csv_ids(_playa_arg("included-categories") or "")
     excluded_categories = _csv_ids(_playa_arg("excluded-categories") or "")
+    # Content type — отдельная PLAY'A category group. Эта функция фильтрует
+    # только локальные полные видео; trailer-карточки добавляются ниже отдельно.
+    if _CONTENT_TRAILER_CATEGORY_ID in included_categories or _CONTENT_FULL_CATEGORY_ID in excluded_categories:
+        return []
+    included_categories = [cid for cid in included_categories if cid not in {_CONTENT_FULL_CATEGORY_ID, _CONTENT_TRAILER_CATEGORY_ID}]
+    excluded_categories = [cid for cid in excluded_categories if cid not in {_CONTENT_FULL_CATEGORY_ID, _CONTENT_TRAILER_CATEGORY_ID}]
 
     actor_name = maps["actors"].get(actor_id) if actor_id else None
     studio_name = maps["studios"].get(studio_id) if studio_id else None
@@ -2360,11 +2447,18 @@ def playa_videos():
     # такое же поведение: локальные полные раздачи идут первыми, затем доступные
     # трейлеры; media URL трейлера будет получен свежим только при открытии video.
     actor_id = (_playa_arg("actor") or "").strip()
-    if actor_id:
+    included_type_ids = set(_csv_ids(_playa_arg("included-categories") or ""))
+    excluded_type_ids = set(_csv_ids(_playa_arg("excluded-categories") or ""))
+    trailers_allowed = (
+        _CONTENT_FULL_CATEGORY_ID not in included_type_ids
+        and _CONTENT_TRAILER_CATEGORY_ID not in excluded_type_ids
+    )
+    if actor_id and trailers_allowed:
         actor_name = _playa_collect_entities(_catalog_items())["actors"].get(actor_id)
         if actor_name:
             title_filter = (_playa_arg("title") or "").strip().casefold()
             trailers = _external_trailer_scenes_for_actor(actor_name)
+            _match_external_scenes_to_items(trailers, items)
             if title_filter:
                 trailers = [scene for scene in trailers if title_filter in (scene.get("title") or "").casefold()]
             content.extend(_external_trailer_list_view(scene) for scene in trailers)
@@ -2378,7 +2472,7 @@ def playa_video_detail(item_id):
     external = _parse_external_video_id(item_id)
     if external:
         try:
-            view = _external_trailer_video_view(*external)
+            view = _external_trailer_video_view(*external, base_url=_base_url())
         except Exception as e:
             log.info("Не удалось получить trailer video %s: %s", item_id, e)
             view = {}
@@ -2476,17 +2570,30 @@ def playa_studio_detail(studio_id):
     })
 
 
+def _playa_content_type_categories(base_url: str) -> list:
+    preview = _placeholder_url(base_url)
+    return [
+        {"id": _CONTENT_FULL_CATEGORY_ID, "title": "Full videos", "preview": preview},
+        {"id": _CONTENT_TRAILER_CATEGORY_ID, "title": "Trailers", "preview": preview},
+    ]
+
+
 @app.get(f"{_PLAYA_PREFIX}/categories")
 @app.get(f"{_PLAYA_PREFIX}/categories;")
 def playa_categories():
-    return _playa_response(_playa_category_entries(_library_items(), _base_url()))
+    base_url = _base_url()
+    return _playa_response(_playa_content_type_categories(base_url) + _playa_category_entries(_library_items(), base_url))
 
 
 @app.get(f"{_PLAYA_PREFIX}/categories-groups")
 @app.get(f"{_PLAYA_PREFIX}/categories-groups;")
 def playa_categories_groups():
-    categories = _playa_category_entries(_library_items(), _base_url())
-    return _playa_response([{"id": "tags", "title": "Tags", "items": categories}])
+    base_url = _base_url()
+    categories = _playa_category_entries(_library_items(), base_url)
+    return _playa_response([
+        {"id": "content_type", "title": "Content", "items": _playa_content_type_categories(base_url)},
+        {"id": "tags", "title": "Tags", "items": categories},
+    ])
 
 
 @app.get(f"{_PLAYA_PREFIX}/video-statuses")
