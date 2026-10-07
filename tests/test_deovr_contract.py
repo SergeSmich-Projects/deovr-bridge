@@ -282,7 +282,7 @@ class DeoVRContractTests(unittest.TestCase):
 
         actor_detail = client.get(f"/api/playa/v2/actor/{actor_id}", headers={"Host": "192.168.1.2:9999"}).get_json()
         prop_names = [prop["name"] for prop in actor_detail["data"]["properties"]]
-        self.assertEqual(prop_names, ["Videos", "Local list"])
+        self.assertEqual(prop_names, ["Videos", "pornolab", "Local list"])
 
         studios = client.get("/api/playa/v2/studios", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertIn("/entity-placeholder/studio/", studios["data"]["content"][0]["preview"])
@@ -326,6 +326,50 @@ class DeoVRContractTests(unittest.TestCase):
         )
         actors = client.get("/api/playa/v2/actors", headers={"Host": "192.168.1.2:9999"}).get_json()
         self.assertEqual(actors["data"]["content"][0]["title"], "Actor One")
+
+    def test_actor_matching_aggregates_hidden_tracker_and_aliases(self):
+        db_path = _temp_db(self)
+        app_mod, store_mod = _load_app_for_db(db_path, hidden_sites="xxxclub")
+        store_mod.upsert_item(_sample_item(
+            id="pl_1", topic_id="1", title="Visible Blake scene",
+            performers=["Blake Blossom"], site="pornolab", source_rank=0,
+        ))
+        store_mod.upsert_item(_sample_item(
+            id="xc_1", topic_id="1", title="Hidden Blake scene",
+            performers=["BlakeBlossom"], site="xxxclub", source_rank=1,
+        ))
+        store_mod.upsert_item(_sample_item(
+            id="xc_2", topic_id="2", title="Hidden alias scene",
+            performers=["Blake B."], site="xxxclub", source_rank=2,
+        ))
+        client = app_mod.app.test_client()
+        alias_response = client.post("/catalog/aliases", json={
+            "kind": "actor", "alias": "Blake B.", "canonical_title": "Blake Blossom",
+        })
+        self.assertEqual(alias_response.status_code, 200)
+
+        common_headers = {"Host": "192.168.1.2:9999"}
+        general = client.get("/api/playa/v2/videos?page-size=20", headers=common_headers).get_json()
+        self.assertEqual([row["id"] for row in general["data"]["content"]], ["pl_1"])
+
+        actors = client.get("/api/playa/v2/actors?page-size=20", headers=common_headers).get_json()
+        matches = [row for row in actors["data"]["content"] if row["title"] == "Blake Blossom"]
+        self.assertEqual(len(matches), 1)
+        actor_id = matches[0]["id"]
+        actor_detail = client.get(f"/api/playa/v2/actor/{actor_id}", headers=common_headers).get_json()
+        properties = {row["name"]: row["value"] for row in actor_detail["data"]["properties"]}
+        self.assertEqual(properties["Videos"], "3")
+        self.assertEqual(properties["XXXClub"], "2")
+
+        actor_videos = client.get(
+            f"/api/playa/v2/videos?actor={actor_id}&page-size=20", headers=common_headers,
+        ).get_json()
+        self.assertEqual(
+            {row["id"] for row in actor_videos["data"]["content"]},
+            {"pl_1", "xc_1", "xc_2"},
+        )
+        hidden_detail = client.get("/api/playa/v2/video/xc_1", headers=common_headers).get_json()
+        self.assertEqual(hidden_detail["status"]["code"], 1)
 
     def test_vrporn_playa_metadata_provider_uses_playa_preview_fields(self):
         db_path = _temp_db(self)

@@ -160,6 +160,28 @@ def init_db():
             """
         )
 
+        # Канонические псевдонимы для объединения сущностей из разных каталогов
+        # и трекеров: "VR Bangers", "VRBangers" и "vrbangers.com" должны вести
+        # к одной studio-карточке. alias_key уже нормализован вызывающим кодом.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_aliases (
+                kind TEXT NOT NULL,          -- actor | studio
+                alias_key TEXT NOT NULL,
+                alias TEXT,
+                canonical_title TEXT NOT NULL,
+                source TEXT DEFAULT 'manual',
+                external_id TEXT DEFAULT '',
+                updated_at INTEGER,
+                PRIMARY KEY (kind, alias_key)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entity_aliases_canonical "
+            "ON entity_aliases(kind, canonical_title)"
+        )
+
         _db_initialized = True
         _db_initialized_path = config.DB_PATH
 
@@ -445,6 +467,53 @@ def all_entity_list_entries(list_name: str = None, kind: str = None) -> list:
     with _lock, _conn() as conn:
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
+
+
+def upsert_entity_alias(kind: str, alias_key: str, alias: str, canonical_title: str,
+                        source: str = "manual", external_id: str = ""):
+    ensure_db()
+    if kind not in {"actor", "studio"} or not alias_key or not canonical_title:
+        return
+    with _lock, _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO entity_aliases
+                (kind, alias_key, alias, canonical_title, source, external_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(kind, alias_key) DO UPDATE SET
+                alias=excluded.alias,
+                canonical_title=excluded.canonical_title,
+                source=excluded.source,
+                external_id=excluded.external_id,
+                updated_at=excluded.updated_at
+            """,
+            (kind, alias_key, alias or "", canonical_title, source or "manual",
+             external_id or "", int(time.time())),
+        )
+
+
+def resolve_entity_alias(kind: str, alias_key: str):
+    ensure_db()
+    if not alias_key:
+        return None
+    with _lock, _conn() as conn:
+        row = conn.execute(
+            "SELECT canonical_title FROM entity_aliases WHERE kind = ? AND alias_key = ?",
+            (kind, alias_key),
+        ).fetchone()
+        return row["canonical_title"] if row else None
+
+
+def all_entity_aliases(kind: str = None) -> list:
+    ensure_db()
+    sql = "SELECT kind, alias_key, alias, canonical_title, source, external_id, updated_at FROM entity_aliases"
+    args = []
+    if kind is not None:
+        sql += " WHERE kind = ?"
+        args.append(kind)
+    sql += " ORDER BY kind, canonical_title COLLATE NOCASE, alias COLLATE NOCASE"
+    with _lock, _conn() as conn:
+        return [dict(row) for row in conn.execute(sql, args).fetchall()]
 
 
 def get_crawl_state(section_url: str) -> dict:

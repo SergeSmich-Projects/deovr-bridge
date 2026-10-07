@@ -86,6 +86,15 @@ def _library_items() -> list:
     return [item for item in store.all_items() if _is_item_visible(item)]
 
 
+def _catalog_items() -> list:
+    """Все индексированные источники для actor/studio matching.
+
+    Сырые карточки скрытых сайтов не попадают в общую ленту, но найденные по
+    актёру/студии релизы доступны как результаты агрегатора и воспроизводятся.
+    """
+    return store.all_items()
+
+
 def _get_library_item(item_id: str):
     item = store.get_item(item_id)
     if not item or not _is_item_visible(item):
@@ -671,9 +680,10 @@ def stream_redirect(item_id):
     TorrServe - сюда плеер обращается ТОЛЬКО когда по-настоящему начинает
     читать видео-поток (т.е. пользователь реально нажал play), а не просто
     при подгрузке карточки/метаданных (см. комментарий в video_detail()).
-    Резолвим и делаем редирект на настоящий адрес TorrServe.
+    Результаты actor/studio matching могут происходить из скрытого в общей
+    ленте источника, поэтому воспроизводить разрешаем любую индексированную запись.
     """
-    item = _get_library_item(item_id)
+    item = store.get_item(item_id)
     if not item:
         return jsonify({"error": "not found"}), 404
 
@@ -834,8 +844,50 @@ def _playa_arg(name: str, default: str = "") -> str:
     return request.args.get(name, request.args.get(f"amp;{name}", default))
 
 
+_ENTITY_ALIAS_CACHE = None
+_ENTITY_ALIAS_CACHE_LOCK = threading.Lock()
+
+
+def _entity_alias_map() -> dict:
+    global _ENTITY_ALIAS_CACHE
+    if _ENTITY_ALIAS_CACHE is None:
+        with _ENTITY_ALIAS_CACHE_LOCK:
+            if _ENTITY_ALIAS_CACHE is None:
+                _ENTITY_ALIAS_CACHE = {
+                    (row["kind"], row["alias_key"]): row["canonical_title"]
+                    for row in store.all_entity_aliases()
+                }
+    return _ENTITY_ALIAS_CACHE
+
+
+def _invalidate_entity_alias_cache():
+    global _ENTITY_ALIAS_CACHE
+    with _ENTITY_ALIAS_CACHE_LOCK:
+        _ENTITY_ALIAS_CACHE = None
+
+
+def _entity_alias_key(title: str) -> str:
+    """Ключ сопоставления имён из PLAY'A-каталогов и torrent-релизов."""
+    text = unicodedata.normalize("NFKD", title or "").encode("ascii", "ignore").decode("ascii")
+    text = text.casefold().replace("&", "and")
+    text = re.sub(r"\.(?:com|net|tv)\b", "", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _canonical_entity_title(kind: str, title: str) -> str:
+    key = _entity_alias_key(title)
+    return _entity_alias_map().get((kind, key)) or (title or "").strip()
+
+
+def _entity_values_match(kind: str, left: str, right: str) -> bool:
+    left_title = _canonical_entity_title(kind, left)
+    right_title = _canonical_entity_title(kind, right)
+    return _entity_alias_key(left_title) == _entity_alias_key(right_title)
+
+
 def _playa_entity_id(kind: str, title: str) -> str:
-    digest = hashlib.sha1(f"{kind}:{title}".encode("utf-8")).hexdigest()[:16]
+    canonical = _canonical_entity_title(kind, title)
+    digest = hashlib.sha1(f"{kind}:{canonical}".encode("utf-8")).hexdigest()[:16]
     return f"{kind}_{digest}"
 
 
@@ -1877,7 +1929,18 @@ def _csv_ids(value: str) -> list:
 
 
 def _playa_entity_map(kind: str, values: list) -> dict:
-    return {_playa_entity_id(kind, value): value for value in values if value}
+    result = {}
+    seen_keys = set()
+    for value in values:
+        if not value:
+            continue
+        canonical = _canonical_entity_title(kind, value) if kind in {"actor", "studio"} else value
+        key = _entity_alias_key(canonical) if kind in {"actor", "studio"} else canonical.casefold()
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        result[_playa_entity_id(kind, canonical)] = canonical
+    return result
 
 
 def _playa_collect_entities(items: list) -> dict:
@@ -1918,9 +1981,15 @@ def _playa_filter_videos(items: list) -> list:
         ).casefold()
         if title and title not in haystack:
             continue
-        if actor_name and actor_name not in item.get("performers", []):
+        if actor_name and not any(
+            _entity_values_match("actor", actor_name, value)
+            for value in item.get("performers", [])
+        ):
             continue
-        if studio_name and studio_name not in item.get("studio", []):
+        if studio_name and not any(
+            _entity_values_match("studio", studio_name, value)
+            for value in item.get("studio", [])
+        ):
             continue
         item_tags = set(item.get("tags", []))
         if any(name not in item_tags for name in included_names if name):
@@ -2040,12 +2109,14 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str, enr
     by_title = {}
     listed_ids = store.entity_list_ids(_entity_list_name(), kind) if _valid_entity_list_kind(kind) else set()
     for item in items:
-        for title in item.get(field, []):
-            if not title:
+        for raw_title in item.get(field, []):
+            if not raw_title:
                 continue
+            title = _canonical_entity_title(kind, raw_title)
+            match_key = _entity_alias_key(title)
             entity_id = _playa_entity_id(kind, title)
             entry = by_title.setdefault(
-                title,
+                match_key,
                 {
                     "id": entity_id,
                     "title": title,
@@ -2056,12 +2127,18 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str, enr
                     "trailer_url": "",
                     "count": 0,
                     "studios": set(),
+                    "source_counts": {},
                     "in_list": entity_id in listed_ids,
                 },
             )
             entry["in_list"] = entry["id"] in listed_ids
             entry["count"] += 1
-            entry["studios"].update(item.get("studio", []))
+            source_id = item.get("site") or "pornolab"
+            entry["source_counts"][source_id] = entry["source_counts"].get(source_id, 0) + 1
+            entry["studios"].update(
+                _canonical_entity_title("studio", studio)
+                for studio in item.get("studio", []) if studio
+            )
 
     entries = list(by_title.values())
     title_filter = (_playa_arg("title") or "").strip().casefold()
@@ -2126,7 +2203,10 @@ def playa_config():
 @app.get(f"{_PLAYA_PREFIX}/videos")
 def playa_videos():
     base_url = _base_url()
-    items = _playa_filter_videos(_library_items())
+    # Общая лента по-прежнему не показывает скрытые источники (например,
+    # XXXClub), но actor/studio drill-down ищет по всему локальному индексу.
+    has_entity_filter = bool((_playa_arg("actor") or "").strip() or (_playa_arg("studio") or "").strip())
+    items = _playa_filter_videos(_catalog_items() if has_entity_filter else _library_items())
     page_index, page_size = _playa_page_args()
     content = [_playa_list_view(item, base_url) for item in items]
     return _playa_response(_playa_page(content, page_index, page_size))
@@ -2134,7 +2214,8 @@ def playa_videos():
 
 @app.get(f"{_PLAYA_PREFIX}/video/<item_id>")
 def playa_video_detail(item_id):
-    item = _get_library_item(item_id)
+    # PLAY'A может прийти сюда из actor/studio matching-выдачи скрытого источника.
+    item = store.get_item(item_id)
     if not item:
         return _playa_not_found("Video not found")
     return _playa_response(_playa_video_view(item, _base_url()))
@@ -2149,6 +2230,9 @@ def _playa_entity_properties(entry: dict) -> list:
     # links. Поэтому управление списком делаем через web UI /entity-lists, а не
     # через некликабельные URL в карточке.
     props = [{"name": "Videos", "value": str(int(entry.get("count") or 0))}]
+    source_counts = entry.get("source_counts") or {}
+    for source_id, count in sorted(source_counts.items()):
+        props.append({"name": _site_label(source_id) or source_id, "value": str(int(count))})
     props.append({"name": "Local list", "value": "yes" if entry.get("in_list") else "no"})
     return props
 
@@ -2156,7 +2240,7 @@ def _playa_entity_properties(entry: dict) -> list:
 @app.get(f"{_PLAYA_PREFIX}/actors")
 def playa_actors():
     base_url = _base_url()
-    entries = _playa_entity_entries("actor", _library_items(), "performers", base_url)
+    entries = _playa_entity_entries("actor", _catalog_items(), "performers", base_url)
     page_index, page_size = _playa_page_args()
     page = _playa_page(entries, page_index, page_size)
     _playa_schedule_entity_meta_refresh("actor", page["content"], force=_playa_refresh_meta_requested())
@@ -2170,7 +2254,7 @@ def playa_actors():
 @app.get(f"{_PLAYA_PREFIX}/actor/<actor_id>")
 def playa_actor_detail(actor_id):
     base_url = _base_url()
-    entries = _playa_entity_entries("actor", _library_items(), "performers", base_url)
+    entries = _playa_entity_entries("actor", _catalog_items(), "performers", base_url)
     entry = next((e for e in entries if e["id"] == actor_id), None)
     if not entry:
         return _playa_not_found("Actor not found")
@@ -2193,7 +2277,7 @@ def playa_actor_detail(actor_id):
 @app.get(f"{_PLAYA_PREFIX}/studios")
 def playa_studios():
     base_url = _base_url()
-    entries = _playa_entity_entries("studio", _library_items(), "studio", base_url)
+    entries = _playa_entity_entries("studio", _catalog_items(), "studio", base_url)
     page_index, page_size = _playa_page_args()
     page = _playa_page(entries, page_index, page_size)
     _playa_schedule_entity_meta_refresh("studio", page["content"], force=_playa_refresh_meta_requested())
@@ -2207,7 +2291,7 @@ def playa_studios():
 @app.get(f"{_PLAYA_PREFIX}/studio/<studio_id>")
 def playa_studio_detail(studio_id):
     base_url = _base_url()
-    entries = _playa_entity_entries("studio", _library_items(), "studio", base_url)
+    entries = _playa_entity_entries("studio", _catalog_items(), "studio", base_url)
     entry = next((e for e in entries if e["id"] == studio_id), None)
     if not entry:
         return _playa_not_found("Studio not found")
@@ -2337,6 +2421,38 @@ button{{padding:9px 14px;border-radius:8px;border:0;background:#3662ff;color:whi
 </div></body></html>"""
     return Response(page, mimetype="text/html; charset=utf-8")
 
+
+@app.route("/catalog/aliases", methods=["GET", "POST"])
+def catalog_aliases():
+    """Просмотр/добавление явных псевдонимов для actor/studio matching."""
+    if request.method == "GET":
+        kind = (request.args.get("kind") or "").strip() or None
+        if kind and kind not in {"actor", "studio"}:
+            return jsonify({"error": "kind must be actor or studio"}), 400
+        return jsonify({"items": store.all_entity_aliases(kind)})
+
+    payload = request.get_json(silent=True) or request.form
+    kind = (payload.get("kind") or "").strip()
+    alias = (payload.get("alias") or "").strip()
+    canonical_title = (payload.get("canonical_title") or payload.get("canonical") or "").strip()
+    if kind not in {"actor", "studio"} or not alias or not canonical_title:
+        return jsonify({"error": "kind, alias and canonical_title are required"}), 400
+    alias_key = _entity_alias_key(alias)
+    if not alias_key:
+        return jsonify({"error": "alias has no searchable characters"}), 400
+    store.upsert_entity_alias(
+        kind, alias_key, alias, canonical_title,
+        source=(payload.get("source") or "manual").strip(),
+        external_id=(payload.get("external_id") or "").strip(),
+    )
+    _invalidate_entity_alias_cache()
+    return jsonify({
+        "ok": True,
+        "kind": kind,
+        "alias": alias,
+        "canonical_title": canonical_title,
+        "alias_key": alias_key,
+    })
 
 
 @app.get("/debug/playa/video/<item_id>")
