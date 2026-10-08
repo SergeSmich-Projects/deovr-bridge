@@ -1,0 +1,148 @@
+{
+  "task": "net_probe",
+  "schema": 1,
+  "ref": "main",
+  "sha": "400cfd09bc8059498427f02714035d88c38cae4e",
+  "run_id": "37809943489",
+  "runner": "DESKTOP-CL23GML",
+  "started_at": "2026-10-08T16:35:19Z",
+  "finished_at": "2026-10-08T16:35:20Z",
+  "ok": true,
+  "results": [
+    {
+      "name": "pornolab_section_vr",
+      "url": "https://pornolab.net/forum/viewforum.php?f=1823",
+      "method": "GET",
+      "note": "Основной форум, раздел VR (FORUM_SECTION_URLS). Смотрим, что отдаётся анонимно: страница раздела, форма логина или антибот.",
+      "status": 200,
+      "reason": "OK",
+      "final_url": "https://pornolab.net/forum/viewforum.php?f=1823",
+      "elapsed_ms": 257,
+      "content_type": "text/html; charset=windows-1251",
+      "bytes": 88039,
+      "bytes_original": 88039,
+      "body_file": "net_probe__pornolab_section_vr.html.gz",
+      "sha256": "16bded6cf9ffef714eb3866d81ed5c3223217394a2a2bf6099af3c80c46f782b",
+      "redactions": 0,
+      "title": "Порноролики в 3D и Virtual Reality (VR) / 3D &amp; Virtual Reality Videos [стр. 1] :: Тематические релизы раздач / Topic Releases :: PornoLab.Net",
+      "signals": [
+        "login-page"
+      ],
+      "headers": {
+        "Server": "nginx",
+        "Content-Type": "text/html; charset=windows-1251",
+        "Cache-Control": "private, pre-check=0, post-check=0, max-age=0"
+      },
+      "error": null
+    },
+    {
+      "name": "xxxclub_vr_browse",
+      "url": "https://xxxclub.to/torrents/browse/6/",
+      "method": "GET",
+      "note": "XXXClub, категория VR (XXXCLUB_CATEGORY_PATH). По коду проекта логин не нужен - проверяем структуру списка и ссылки.",
+      "status": 200,
+      "reason": "OK",
+      "final_url": "https://xxxclub.to/torrents/browse/6/",
+      "elapsed_ms": 254,
+      "content_type": "text/html; charset=UTF-8",
+      "bytes": 84685,
+      "bytes_original": 84685,
+      "body_file": "net_probe__xxxclub_vr_browse.html.gz",
+      "sha256": "a94565a072178a7dfc663fc75473729c02f499dfaa2fa63b4e0416d6a659f773",
+      "redactions": 0,
+      "title": "XXXClub : VR , Virtual Reality , Adult , Porn , Videos , Download , Torrents",
+      "signals": [],
+      "headers": {
+        "Content-Type": "text/html; charset=UTF-8",
+        "Server": "cloudflare",
+        "Cache-Control": "public, max-age=300"
+      },
+      "error": null
+    },
+    {
+      "name": "knaben_search_vr",
+      "url": "https://api.knaben.org/v1",
+      "method": "POST",
+      "note": "Knaben meta-index. Форма запроса повторяет knaben.search(), чтобы видеть реальную схему ответа (hits, infohash, seeders).",
+      "status": 200,
+      "reason": "OK",
+      "final_url": "https://api.knaben.org/v1",
+      "elapsed_ms": 346,
+      "content_type": "application/json",
+      "bytes": 35054,
+      "bytes_original": 35054,
+      "body_file": "net_probe__knaben_search_vr.json.gz",
+      "sha256": "3ed18a8660ae666f06343776aa42b64c3a7e99149eb3c10cb7890c2cb700b344",
+      "redactions": 0,
+      "title": "",
+      "signals": [],
+      "headers": {
+        "Content-Type": "application/json",
+        "server": "cloudflare"
+      },
+      "error": null
+    },
+    {
+      "name": "vrporn_playa_studios",
+      "url": "https://vrporn.com/api/playa/v2/studios?page-size=50",
+      "method": "GET",
+      "note": "Внешний PLAY'A API v2 (студии) - app.py запрашивает его с page-size=1000; здесь меньше, чтобы тело отчёта оставалось компактным, схема полей та же.",
+      "status": 200,
+      "reason": "OK",
+      "final_url": "https://vrporn.com/api/playa/v2/studios?page-size=50",
+      "elapsed_ms": 452,
+      "content_type": "application/json",
+      "bytes": 6502,
+      "bytes_original": 6502,
+      "body_file": "net_probe__vrporn_playa_studios.json.gz",
+      "sha256": "dac8818285016a679a16207c94f252105123c94255529311920901f2e0629c2a",
+      "redactions": 0,
+      "title": "",
+      "signals": [],
+      "headers": {
+        "Content-Type": "application/json",
+        "Server": "cloudflare",
+        "Cache-Control": "no-cache, private"
+      },
+      "error": null
+    }
+  ],
+  "history": {
+    "pornolab_section_vr": [
+      {
+        "ts": "2026-10-08T16:35:19Z",
+        "status": 200,
+        "bytes": 88039,
+        "sha256": "16bded6cf9ff",
+        "error": null
+      }
+    ],
+    "xxxclub_vr_browse": [
+      {
+        "ts": "2026-10-08T16:35:20Z",
+        "status": 200,
+        "bytes": 84685,
+        "sha256": "a94565a07217",
+        "error": null
+      }
+    ],
+    "knaben_search_vr": [
+      {
+        "ts": "2026-10-08T16:35:20Z",
+        "status": 200,
+        "bytes": 35054,
+        "sha256": "3ed18a8660ae",
+        "error": null
+      }
+    ],
+    "vrporn_playa_studios": [
+      {
+        "ts": "2026-10-08T16:35:20Z",
+        "status": 200,
+        "bytes": 6502,
+        "sha256": "dac881828501",
+        "error": null
+      }
+    ]
+  }
+}
