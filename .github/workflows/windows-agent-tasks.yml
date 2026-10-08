@@ -6,7 +6,18 @@ name: Windows agent tasks
 # читаемый им канал - git, и результат публикуется коммитом в ветку ci-reports,
 # а не в лог.
 #
-# Особенности этой схемы (сознательные):
+# ВАЖНО (проверено на практике, прогон #1 от 2026-10-08):
+#   в блоках run: допустимы ТОЛЬКО символы ASCII.
+#   Windows PowerShell 5.1 читает сгенерированный .ps1 как системную ANSI-кодировку
+#   (CP1251 на русской Windows), а не как UTF-8. Кириллица при этом превращается
+#   в мусор, а буквы Д/В/Г/Б/ё дают символы U+201C/U+201D/U+2018/U+2019, которые
+#   PowerShell считает ограничителями строк - скрипт падает с ошибкой разбора
+#   ещё до запуска ("The string is missing the terminator").
+#   Поэтому: сообщения в run-блоках - по-английски, кириллица живёт в питоновских
+#   файлах (Python читает исходники как UTF-8) и в комментариях YAML (они в
+#   .ps1 не попадают). Тест tests/test_ci_workflows.py это правило проверяет.
+#
+# Остальные особенности схемы (сознательные):
 #   * workflow должен существовать в ветке main - таково требование
 #     workflow_dispatch, поэтому перед первым запуском PR нужно смёржить;
 #   * НЕТ входных параметров: тело задачи берётся из кода репозитория, а не из
@@ -14,8 +25,8 @@ name: Windows agent tasks
 #   * НЕТ secrets: используется только автоматический github.token;
 #   * НЕТ сторонних actions: код забирается обычным git. Так задача не зависит
 #     от версии раннера и Node, которые на машине могут быть любыми;
-#   * на диске задача трогает только RUNNER_TEMP; ни cookies, ни .env, ни база
-#     проекта не читаются - см. scripts/ci/README.md.
+#   * причины сбоя дублируются в аннотации через ##[error]: лог прогона агент
+#     прочитать не может, а аннотации читает через API.
 
 on:
   workflow_dispatch:
@@ -37,7 +48,7 @@ jobs:
       # только для доступа к этому же репозиторию.
       GH_TOKEN: ${{ github.token }}
       GIT_TERMINAL_PROMPT: "0"   # не ждать ввода пароля, а сразу падать
-      PYTHONIOENCODING: utf-8
+      PYTHONIOENCODING: utf-8    # чтобы русский вывод python не ронял процесс
 
     steps:
       - name: Diagnostics
@@ -46,14 +57,15 @@ jobs:
         # окружение, чтобы первая же неудача была диагностируемой.
         run: |
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          Write-Host "Runner OS:        $env:RUNNER_OS $env:RUNNER_ARCH"
-          Write-Host "Runner name:      $env:RUNNER_NAME"
+          Write-Host "Runner OS:          $env:RUNNER_OS $env:RUNNER_ARCH"
+          Write-Host "Runner name:        $env:RUNNER_NAME"
           Write-Host "Runner environment: $env:RUNNER_ENVIRONMENT"
-          Write-Host "Workspace:        $env:RUNNER_WORKSPACE"
-          Write-Host "Temp:             $env:RUNNER_TEMP"
-          Write-Host "PowerShell:       $($PSVersionTable.PSVersion)"
+          Write-Host "Workspace:          $env:RUNNER_WORKSPACE"
+          Write-Host "Temp:               $env:RUNNER_TEMP"
+          Write-Host "PowerShell:         $($PSVersionTable.PSVersion)"
 
-          try { Write-Host "git:              $(& git --version)" } catch { Write-Host "git: не найден" }
+          try { Write-Host "git:                $(& git --version)" }
+          catch { Write-Host "git:                NOT FOUND" }
 
           $py = $null
           $pyArgs = @()
@@ -62,26 +74,31 @@ jobs:
           elseif ($env:DEOVR_CI_PYTHON) { $py = $env:DEOVR_CI_PYTHON }
 
           if ($py) {
-            Write-Host "python:           $py $($pyArgs -join ' ') -> $(& $py @pyArgs --version)"
-            Write-Host "python path:      $(& $py @pyArgs -c 'import sys; print(sys.executable)')"
-            Write-Host "requests:         $(& $py @pyArgs -c 'import requests; print(requests.__version__)' 2>&1)"
-            Write-Host "curl_cffi:        $(& $py @pyArgs -c 'import curl_cffi; print(curl_cffi.__version__)' 2>&1)"
+            Write-Host "python:             $py $($pyArgs -join ' ')"
+            Write-Host "python version:     $(& $py @pyArgs --version 2>&1)"
+            Write-Host "python path:        $(& $py @pyArgs -c 'import sys; print(sys.executable)' 2>&1)"
+            Write-Host "requests:           $(& $py @pyArgs -c 'import requests; print(requests.__version__)' 2>&1)"
+            Write-Host "curl_cffi:          $(& $py @pyArgs -c 'import curl_cffi; print(curl_cffi.__version__)' 2>&1)"
           } else {
-            Write-Host "python:           НЕ НАЙДЕН (укажите путь в переменной DEOVR_CI_PYTHON)"
+            Write-Host "python:             NOT FOUND (set DEOVR_CI_PYTHON to a full path)"
           }
 
-          # Версия раннера и набор Node в его externals пригодятся, если когда-нибудь
-          # понадобится действие из Marketplace (сейчас они не используются).
+          # Runner version comes from file properties, not from executing the
+          # exe: starting Runner.Listener.exe for a version string is unsafe.
           try {
             $runnerRoot = Split-Path (Split-Path $env:RUNNER_WORKSPACE)
-            Write-Host "runner root:      $runnerRoot"
+            Write-Host "runner root:        $runnerRoot"
             $listener = Join-Path $runnerRoot "bin\Runner.Listener.exe"
-            if (Test-Path $listener) { Write-Host "runner version:   $(& $listener --version)" }
+            if (Test-Path $listener) {
+              Write-Host "runner version:     $((Get-Item $listener).VersionInfo.FileVersion)"
+            }
             $externals = Join-Path $runnerRoot "externals"
             if (Test-Path $externals) {
-              Write-Host "runner node:      $((Get-ChildItem -Directory $externals | Select-Object -ExpandProperty Name) -join ', ')"
+              Write-Host "runner node:        $((Get-ChildItem -Directory $externals | Select-Object -ExpandProperty Name) -join ', ')"
             }
-          } catch { Write-Host "runner root: определить не удалось ($($_.Exception.Message))" }
+          } catch {
+            Write-Host "runner root:        NOT DETECTED ($($_.Exception.Message))"
+          }
 
       - name: Fetch task code
         shell: powershell
@@ -89,10 +106,13 @@ jobs:
           $ErrorActionPreference = "Stop"
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-          if (-not $env:GH_TOKEN) { throw "Нет GH_TOKEN - без него приватный репозиторий не клонируется" }
+          if (-not $env:GH_TOKEN) {
+            Write-Host "##[error] GH_TOKEN is empty: without it the private repository cannot be cloned."
+            throw "GH_TOKEN is empty"
+          }
 
-          # Доступ через git-конфиг в переменных окружения: токен не попадает
-          # ни в командную строку, ни в URL, ни в конфиг на диске.
+          # Credentials go through the git config in environment variables: the
+          # token never reaches the command line, the URL or an on-disk config.
           $pair = "x-access-token:$env:GH_TOKEN"
           $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
           $env:GIT_CONFIG_COUNT = "2"
@@ -105,14 +125,18 @@ jobs:
           if (Test-Path $src) { Remove-Item -Recurse -Force $src }
 
           $url = "https://github.com/$env:GITHUB_REPOSITORY.git"
-          Write-Host "Клонирую $env:GITHUB_REPOSITORY, ветка $env:GITHUB_REF_NAME"
+          Write-Host "Cloning $env:GITHUB_REPOSITORY, branch $env:GITHUB_REF_NAME"
           & git clone --quiet --depth 1 --branch $env:GITHUB_REF_NAME $url $src
-          if ($LASTEXITCODE -ne 0) { throw "git clone вернул код $LASTEXITCODE" }
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "##[error] git clone failed with exit code $LASTEXITCODE. Check that the job token can read this repository."
+            throw "git clone failed"
+          }
 
           Push-Location $src
           try {
-            Write-Host "Код на месте: $(& git rev-parse HEAD)"
-            Write-Host "Ожидался:     $env:GITHUB_SHA"
+            Write-Host "Checked out: $(& git rev-parse HEAD)"
+            Write-Host "Expected:    $env:GITHUB_SHA"
           } finally { Pop-Location }
 
       - name: Run net_probe
@@ -120,29 +144,39 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $env:PYTHONIOENCODING = "utf-8"
 
           $src = "$env:RUNNER_TEMP\agent-src"
           $out = "$env:RUNNER_TEMP\net_probe_data"
           New-Item -ItemType Directory -Force $out | Out-Null
 
-          $py = if (Get-Command python -ErrorAction SilentlyContinue) { "python" }
-                elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
-                elseif ($env:DEOVR_CI_PYTHON) { $env:DEOVR_CI_PYTHON }
-                else { throw "Python не найден в PATH раннера. Укажите полный путь в переменной окружения DEOVR_CI_PYTHON." }
-          $pyArgs = if ($py -eq "py") { @("-3") } else { @() }
+          $py = $null
+          $pyArgs = @()
+          if (Get-Command python -ErrorAction SilentlyContinue) { $py = "python" }
+          elseif (Get-Command py -ErrorAction SilentlyContinue) { $py = "py"; $pyArgs = @("-3") }
+          elseif ($env:DEOVR_CI_PYTHON) { $py = $env:DEOVR_CI_PYTHON }
 
-          # requests нужен задаче; проверяем отдельно, чтобы ошибка была внятной,
-          # а не «ImportError» из глубины скрипта.
+          if (-not $py) {
+            Write-Host "##[error] Python not found by the runner. Find the interpreter the application uses (for example .venv\Scripts\python.exe inside the project), set the machine environment variable DEOVR_CI_PYTHON to its full path and restart the runner."
+            throw "Python not found"
+          }
+
+          # 'requests' is checked separately so that the reason shows up as an
+          # annotation instead of drowning in an import traceback.
           & $py @pyArgs -c "import requests" 2>&1 | Out-Null
           if ($LASTEXITCODE -ne 0) {
-            throw "В интерпретаторе '$py' нет пакета requests. Установите: $py -m pip install requests"
+            Write-Host "##[error] The interpreter '$py' has no 'requests' package. Install it: `"$py`" -m pip install requests"
+            throw "requests is missing"
           }
 
           & $py @pyArgs "$src\scripts\ci\net_probe.py" `
               --targets "$src\scripts\ci\targets.json" `
               --out-dir $out
 
-          if ($LASTEXITCODE -ne 0) { throw "net_probe вернул код $LASTEXITCODE (см. вывод выше)" }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "##[error] net_probe exited with code $LASTEXITCODE. The next step still publishes whatever report exists."
+            throw "net_probe failed"
+          }
 
       - name: Publish report to ci-reports
         if: always()
@@ -150,12 +184,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $env:PYTHONIOENCODING = "utf-8"
 
           $src = "$env:RUNNER_TEMP\agent-src"
           if (-not (Test-Path $src)) {
-            # Код не забрали - публиковать не из чего: без клона нет и правки
-            # истории. Причина видна в предыдущих шагах.
-            throw "Нет клона репозитория ($src) - шаг 'Fetch task code' не отработал, публикация невозможна"
+            Write-Host "##[error] No repository clone at $src : the 'Fetch task code' step did not finish, so there is nothing to publish from. See that step in the log."
+            throw "no clone"
           }
 
           $pair = "x-access-token:$env:GH_TOKEN"
@@ -166,20 +200,30 @@ jobs:
           $env:GIT_CONFIG_KEY_1 = "safe.directory"
           $env:GIT_CONFIG_VALUE_1 = "*"
 
-          $py = if (Get-Command python -ErrorAction SilentlyContinue) { "python" }
-                elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
-                elseif ($env:DEOVR_CI_PYTHON) { $env:DEOVR_CI_PYTHON }
-                else { throw "Python не найден в PATH раннера" }
-          $pyArgs = if ($py -eq "py") { @("-3") } else { @() }
+          $py = $null
+          $pyArgs = @()
+          if (Get-Command python -ErrorAction SilentlyContinue) { $py = "python" }
+          elseif (Get-Command py -ErrorAction SilentlyContinue) { $py = "py"; $pyArgs = @("-3") }
+          elseif ($env:DEOVR_CI_PYTHON) { $py = $env:DEOVR_CI_PYTHON }
 
-          # Публикация вынесена в python-скрипт: он покрыт локальным прогоном
-          # на настоящем git-репозитории (см. scripts/ci/publish_report.py).
+          if (-not $py) {
+            Write-Host "##[error] Python not found by the runner, so the report cannot be published. Set DEOVR_CI_PYTHON to the full path of the interpreter the application uses and restart the runner."
+            throw "Python not found"
+          }
+
+          # Publishing lives in a python script: it is covered by a local run on
+          # a real git repository (see scripts/ci/publish_report.py).
+          # --error is deliberately English: Cyrillic passed from a run block
+          # would land in the report garbled (see the encoding note at the top).
           & $py @pyArgs "$src\scripts\ci\publish_report.py" `
               --repo-dir $src `
               --data-dir "$env:RUNNER_TEMP\net_probe_data" `
               --template-dir "$src\scripts\ci\reports-branch" `
               --task "net_probe" `
-              --error "Задача net_probe не оставила отчёт - смотрите шаг 'Run net_probe' в логе прогона" `
+              --error "The task did not leave a report - see the 'Run net_probe' step output in the run log." `
               --message "net_probe: $env:GITHUB_REF_NAME @ $env:GITHUB_SHA (run $env:GITHUB_RUN_ID)"
 
-          if ($LASTEXITCODE -ne 0) { throw "publish_report вернул код $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "##[error] publish_report exited with code $LASTEXITCODE : the report was not committed to ci-reports."
+            throw "publish_report failed"
+          }
