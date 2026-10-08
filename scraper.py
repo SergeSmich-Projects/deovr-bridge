@@ -1195,6 +1195,11 @@ def refresh_all():
         try:
             if site.get("engine") == "xxxclub":
                 total_seen += _refresh_site_xxxclub(site)
+            elif site.get("engine") == "knaben":
+                # Ленивый import не создаёт циклическую зависимость при обычном
+                # импорте app/scraper и не загружает provider, когда он выключен.
+                import knaben  # noqa: PLC0415
+                total_seen += knaben.refresh()
             else:
                 total_seen += _refresh_site(site)
         except Exception as e:

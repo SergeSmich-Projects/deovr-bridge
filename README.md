@@ -95,6 +95,148 @@ IP компьютера смотрите через `ipconfig` (Windows) / `ip a
 видео в DeoVR — именно в момент клика наш сервер просит TorrServe начать раздавать файл и
 возвращает DeoVR прямую ссылку на поток.
 
+## Подключение в PLAY'A VR
+
+Реализован начальный PLAY'A API v2 рядом с DeoVR:
+
+```
+http://<LAN-IP-вашего-ПК>:9999/api/playa/v2/version
+http://<LAN-IP-вашего-ПК>:9999/api/playa/v2/config
+http://<LAN-IP-вашего-ПК>:9999/api/playa/v2/videos
+http://<LAN-IP-вашего-ПК>:9999/api/playa/v2/video/<id>
+```
+
+В PLAY'A VR: Web → Add Website → ввести:
+
+```
+http://<LAN-IP-вашего-ПК>:9999
+```
+
+PLAY'A сам добавит базовый путь `/api/playa/v2`. Аутентификация отключена (`auth=false`),
+поэтому логин/JWT не нужны. Для воспроизведения используется тот же ленивый `/stream/<id>`:
+TorrServe реально дёргается только при открытии видео, не при просмотре списка.
+
+### Дополнительный поиск через Knaben
+
+При обычном фоновом обновлении и ручном `GET /refresh` мост обращается к публичному
+`https://api.knaben.org/v1`, ищет `VR180`, сортирует результаты по seeders и добавляет безопасные
+magnet-карточки как отдельный источник `Knaben`. API key и регистрация не нужны. Перед сохранением:
+
+- удаляются дубли по BTIH infohash, а среди дублей остаётся вариант с большим числом сидов;
+- отбрасываются результаты без VR180/VR/SBS-признаков, с `S < 2`, подозрительным расширением,
+  размером меньше 1 GiB или больше 500 GiB;
+- принимаются только валидные 40-hex/32-base32 infohash; временные download URL не сохраняются;
+- запрос отправляется с `hide_unsafe=true` и ограничением по свежему `lastSeen`.
+
+Настройки можно положить в локальный `.env` (он уже исключён из Git):
+
+```bash
+ENABLE_KNABEN=1
+KNABEN_QUERIES="VR180;Virtual Reality SBS"
+KNABEN_MIN_SEEDERS=2
+KNABEN_RESULTS_PER_QUERY=150
+KNABEN_MAX_IMPORT_ITEMS=150
+KNABEN_LAST_SEEN_SEC=2592000
+KNABEN_MIN_SIZE_BYTES=1073741824
+KNABEN_MAX_SIZE_BYTES=536870912000
+KNABEN_TIMEOUT_SEC=20
+```
+
+Knaben — meta-index, поэтому его `S/P` являются последним известным снимком, а не гарантией
+скорости прямо сейчас. Фактическое воспроизведение по-прежнему выполняет TorrServe через magnet.
+Отключить только этот источник можно с `ENABLE_KNABEN=0`.
+
+По умолчанию карточки источника `xxxclub` временно скрыты из пользовательской выдачи
+(`/deovr`, `/heresphere`, PLAY'A API), но остаются в БД. Управляется переменной:
+
+```bash
+HIDDEN_LIBRARY_SITE_IDS=xxxclub
+```
+
+Чтобы снова показать все источники, можно запустить с пустым значением:
+
+```bash
+HIDDEN_LIBRARY_SITE_IDS=
+```
+
+### PLAY'A: постеры актёров и логотипы студий
+
+Для страниц Actors/Studios мост лениво пробует подтягивать публичные картинки:
+
+- основной простой источник — PLAY'A API сайта `https://vrporn.com`: `/api/playa/v2/actors`, `/actor/<id>`, `/studios`, `/studio/<id>` уже отдают готовые `preview` для актёров и логотипов студий;
+- если задан `STASHBOX_METADATA_PROVIDERS`, дополнительно можно пробовать структурированные Stash-Box endpoints (например ThePornDB/StashDB) и брать `images` у performer/studio;
+- fallback для актёров: `https://www.vrspy.com/stars` / `https://www.vrspy.com/star/<actor-slug>`;
+- fallback для студий: `https://povr.com/studios` / `https://povr.com/studios/<studio-slug>`;
+- если на странице удаётся найти трейлер одного из роликов, его URL сохраняется только как служебная ссылка в debug/metadata.
+
+Stash-Box provider включается через переменную окружения или локальный `.env` файл (он в `.gitignore`, ключи не коммитить), но для VRPorn PLAY'A API ключ не нужен:
+
+```bash
+STASHBOX_METADATA_PROVIDERS="https://theporndb.net/graphql|TPDB_API_KEY;https://stashdb.org/graphql|STASHDB_API_KEY"
+```
+
+Списки Actors/Studios больше не ждут сетевых lookup'ов синхронно: сначала быстро отдаются названия с PNG-заглушками, а недостающие URL обновляются в фоне и попадают в `cache.sqlite3` для следующего refresh в PLAY'A. Кэшируются только URL и текстовые метаданные, сами изображения/видео не сохраняются в БД. Удачно найденные картинки считаются свежими `EXTERNAL_ENTITY_META_TTL_SEC` секунд (по умолчанию 30 дней); актёры ищутся точечно по title, а студии берутся пачкой из `https://vrporn.com/api/playa/v2/studios?page-size=1000`, чтобы не делать запрос на каждую студию.
+Отключить внешний lookup можно так:
+
+```bash
+ENABLE_EXTERNAL_ENTITY_META=0
+```
+
+Правая панель PLAY'A сейчас отдаёт только группу `Tags` с обычными категориями/тегами. Нативное
+избранное видео PLAY'A не дублируется на стороне моста.
+
+Для актёров/студий, где у PLAY'A нет documented write-favorites endpoint, есть локальный список:
+
+```text
+GET /entity-lists          # простая web-страница с кнопками добавить/убрать
+GET /entity-lists.json     # JSON содержимого списка
+GET /entity-list/<actor|studio>/<id>/toggle?title=<title>
+POST/DELETE /entity-list/<actor|studio>/<id>
+```
+
+Отмеченные актёры/студии поднимаются вверх в PLAY'A Actors/Studios и получают префикс `★`.
+
+### Агрегированный поиск по актёру/студии
+
+Сырые карточки источников из `HIDDEN_LIBRARY_SITE_IDS` (по умолчанию XXXClub) по-прежнему не
+попадают в общую ленту. Но Actors/Studios строятся по полному локальному индексу, и запрос
+`/api/playa/v2/videos?actor=<id>` или `?studio=<id>` возвращает совпавшие релизы сразу из
+PornoLab и XXXClub. Такая карточка открывается и воспроизводится через обычный `/stream/<id>` +
+TorrServe. Имена сравниваются без регистра, пробелов, пунктуации и доменных суффиксов, поэтому
+`VR Bangers`, `VRBangers` и `VRBangers.com` считаются одной сущностью.
+
+При открытии актёра выдача также дополняется trailer-карточками внешнего PLAY'A-каталога.
+Нативная группа фильтров `Content` разделяет выдачу на `Full videos` и `Trailers`; карточки дополнительно
+помечены `FULL`, `TRAILER` или `TRAILER + FULL`. Сцены автоматически сопоставляются с локальными
+раздачами по названию, актёру и студии. У сопоставленной trailer-карточки detail содержит и
+`type=trailer`, и `type=full` со ссылкой через TorrServe; у полной карточки, наоборот, добавляется
+свежий `type=trailer`. Таким образом переход между трейлером и полным роликом реализован штатной
+моделью PLAY'A без некликабельных текстовых URL.
+
+Список трейлеров кэшируется в `external_scenes` на 24 часа, но временные подписанные MP4 URL
+никогда не сохраняются: `/api/playa/v2/video/trailer__<provider>__<id>` запрашивает свежий URL
+при открытии карточки. Сейчас первым provider подключён VRPorn; premium/full URL внешнего сайта не
+проксируется — `full` появляется только после сопоставления с локальной раздачей. Отключение:
+
+```bash
+ENABLE_EXTERNAL_TRAILERS=0
+```
+
+Для настоящих псевдонимов, которые нельзя определить нормализацией, есть постоянная таблица aliases:
+
+```text
+GET  /catalog/aliases?kind=actor
+POST /catalog/aliases
+Content-Type: application/json
+
+{"kind":"actor","alias":"Blake B.","canonical_title":"Blake Blossom"}
+```
+
+Карточки PLAY'A используют две строки: сверху `студия · актёр(ы)`, снизу — сиды/пиры,
+разрешение и короткая дата (`🟢S7 🔴P2 · 3072p · 06.10.26`). Та же техническая строка дублируется
+в `tooltip` / `description` для совместимых клиентов. HTML/CSS в PLAY'A API не поддерживается,
+поэтому цветовой акцент сидов/пиров сделан unicode-индикаторами.
+
 ## Что ещё можно настроить
 
 - **`config.FORUM_MAX_PAGES`** — сколько страниц раздела (по 50 тем) парсить за раз. На старте

@@ -8,3 +8,11 @@ login_debug.html
 resp.json
 new.txt
 .env
+
+# antibot_captcha: runtime-артефакты ручного решения капчи Antibot Cloud.
+# Создаются scraper.prepare_antibot_captcha() при каждом новом челлендже,
+# в репозитории не нужны.
+antibot_captcha/pending.json
+antibot_captcha/candidate_*.jpg
+antibot_captcha/reference.jpg
+antibot_captcha/reference.png

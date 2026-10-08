@@ -1,0 +1,185 @@
+name: Windows agent tasks
+
+# Задачи выполняются на self-hosted раннере пользователя. Причина: у агента нет
+# доступа к внешней сети (кроме github.com/api.github.com/codeload), а логи и
+# артефакты Actions из его песочницы скачать нельзя. Поэтому единственный
+# читаемый им канал - git, и результат публикуется коммитом в ветку ci-reports,
+# а не в лог.
+#
+# Особенности этой схемы (сознательные):
+#   * workflow должен существовать в ветке main - таково требование
+#     workflow_dispatch, поэтому перед первым запуском PR нужно смёржить;
+#   * НЕТ входных параметров: тело задачи берётся из кода репозитория, а не из
+#     строки, введённой человеком (это исключает инъекцию через inputs);
+#   * НЕТ secrets: используется только автоматический github.token;
+#   * НЕТ сторонних actions: код забирается обычным git. Так задача не зависит
+#     от версии раннера и Node, которые на машине могут быть любыми;
+#   * на диске задача трогает только RUNNER_TEMP; ни cookies, ни .env, ни база
+#     проекта не читаются - см. scripts/ci/README.md.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # нужно ровно для одного: закоммитить отчёт в ветку ci-reports
+
+concurrency:
+  group: agent-tasks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  net-probe:
+    name: net_probe
+    runs-on: [self-hosted, Windows, X64, deovr-bridge]
+    timeout-minutes: 15
+    env:
+      # Автоматический токен прогона. GitHub маскирует его в логах; используется
+      # только для доступа к этому же репозиторию.
+      GH_TOKEN: ${{ github.token }}
+      GIT_TERMINAL_PROMPT: "0"   # не ждать ввода пароля, а сразу падать
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Diagnostics
+        shell: powershell
+        # Ничего не проверяем и не падаем: цель - показать в логе, что за
+        # окружение, чтобы первая же неудача была диагностируемой.
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          Write-Host "Runner OS:        $env:RUNNER_OS $env:RUNNER_ARCH"
+          Write-Host "Runner name:      $env:RUNNER_NAME"
+          Write-Host "Runner environment: $env:RUNNER_ENVIRONMENT"
+          Write-Host "Workspace:        $env:RUNNER_WORKSPACE"
+          Write-Host "Temp:             $env:RUNNER_TEMP"
+          Write-Host "PowerShell:       $($PSVersionTable.PSVersion)"
+
+          try { Write-Host "git:              $(& git --version)" } catch { Write-Host "git: не найден" }
+
+          $py = $null
+          $pyArgs = @()
+          if (Get-Command python -ErrorAction SilentlyContinue) { $py = "python" }
+          elseif (Get-Command py -ErrorAction SilentlyContinue) { $py = "py"; $pyArgs = @("-3") }
+          elseif ($env:DEOVR_CI_PYTHON) { $py = $env:DEOVR_CI_PYTHON }
+
+          if ($py) {
+            Write-Host "python:           $py $($pyArgs -join ' ') -> $(& $py @pyArgs --version)"
+            Write-Host "python path:      $(& $py @pyArgs -c 'import sys; print(sys.executable)')"
+            Write-Host "requests:         $(& $py @pyArgs -c 'import requests; print(requests.__version__)' 2>&1)"
+            Write-Host "curl_cffi:        $(& $py @pyArgs -c 'import curl_cffi; print(curl_cffi.__version__)' 2>&1)"
+          } else {
+            Write-Host "python:           НЕ НАЙДЕН (укажите путь в переменной DEOVR_CI_PYTHON)"
+          }
+
+          # Версия раннера и набор Node в его externals пригодятся, если когда-нибудь
+          # понадобится действие из Marketplace (сейчас они не используются).
+          try {
+            $runnerRoot = Split-Path (Split-Path $env:RUNNER_WORKSPACE)
+            Write-Host "runner root:      $runnerRoot"
+            $listener = Join-Path $runnerRoot "bin\Runner.Listener.exe"
+            if (Test-Path $listener) { Write-Host "runner version:   $(& $listener --version)" }
+            $externals = Join-Path $runnerRoot "externals"
+            if (Test-Path $externals) {
+              Write-Host "runner node:      $((Get-ChildItem -Directory $externals | Select-Object -ExpandProperty Name) -join ', ')"
+            }
+          } catch { Write-Host "runner root: определить не удалось ($($_.Exception.Message))" }
+
+      - name: Fetch task code
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          if (-not $env:GH_TOKEN) { throw "Нет GH_TOKEN - без него приватный репозиторий не клонируется" }
+
+          # Доступ через git-конфиг в переменных окружения: токен не попадает
+          # ни в командную строку, ни в URL, ни в конфиг на диске.
+          $pair = "x-access-token:$env:GH_TOKEN"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $env:GIT_CONFIG_COUNT = "2"
+          $env:GIT_CONFIG_KEY_0 = "http.https://github.com/.extraheader"
+          $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $b64"
+          $env:GIT_CONFIG_KEY_1 = "safe.directory"
+          $env:GIT_CONFIG_VALUE_1 = "*"
+
+          $src = "$env:RUNNER_TEMP\agent-src"
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+
+          $url = "https://github.com/$env:GITHUB_REPOSITORY.git"
+          Write-Host "Клонирую $env:GITHUB_REPOSITORY, ветка $env:GITHUB_REF_NAME"
+          & git clone --quiet --depth 1 --branch $env:GITHUB_REF_NAME $url $src
+          if ($LASTEXITCODE -ne 0) { throw "git clone вернул код $LASTEXITCODE" }
+
+          Push-Location $src
+          try {
+            Write-Host "Код на месте: $(& git rev-parse HEAD)"
+            Write-Host "Ожидался:     $env:GITHUB_SHA"
+          } finally { Pop-Location }
+
+      - name: Run net_probe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          $src = "$env:RUNNER_TEMP\agent-src"
+          $out = "$env:RUNNER_TEMP\net_probe_data"
+          New-Item -ItemType Directory -Force $out | Out-Null
+
+          $py = if (Get-Command python -ErrorAction SilentlyContinue) { "python" }
+                elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
+                elseif ($env:DEOVR_CI_PYTHON) { $env:DEOVR_CI_PYTHON }
+                else { throw "Python не найден в PATH раннера. Укажите полный путь в переменной окружения DEOVR_CI_PYTHON." }
+          $pyArgs = if ($py -eq "py") { @("-3") } else { @() }
+
+          # requests нужен задаче; проверяем отдельно, чтобы ошибка была внятной,
+          # а не «ImportError» из глубины скрипта.
+          & $py @pyArgs -c "import requests" 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "В интерпретаторе '$py' нет пакета requests. Установите: $py -m pip install requests"
+          }
+
+          & $py @pyArgs "$src\scripts\ci\net_probe.py" `
+              --targets "$src\scripts\ci\targets.json" `
+              --out-dir $out
+
+          if ($LASTEXITCODE -ne 0) { throw "net_probe вернул код $LASTEXITCODE (см. вывод выше)" }
+
+      - name: Publish report to ci-reports
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          $src = "$env:RUNNER_TEMP\agent-src"
+          if (-not (Test-Path $src)) {
+            # Код не забрали - публиковать не из чего: без клона нет и правки
+            # истории. Причина видна в предыдущих шагах.
+            throw "Нет клона репозитория ($src) - шаг 'Fetch task code' не отработал, публикация невозможна"
+          }
+
+          $pair = "x-access-token:$env:GH_TOKEN"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $env:GIT_CONFIG_COUNT = "2"
+          $env:GIT_CONFIG_KEY_0 = "http.https://github.com/.extraheader"
+          $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $b64"
+          $env:GIT_CONFIG_KEY_1 = "safe.directory"
+          $env:GIT_CONFIG_VALUE_1 = "*"
+
+          $py = if (Get-Command python -ErrorAction SilentlyContinue) { "python" }
+                elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
+                elseif ($env:DEOVR_CI_PYTHON) { $env:DEOVR_CI_PYTHON }
+                else { throw "Python не найден в PATH раннера" }
+          $pyArgs = if ($py -eq "py") { @("-3") } else { @() }
+
+          # Публикация вынесена в python-скрипт: он покрыт локальным прогоном
+          # на настоящем git-репозитории (см. scripts/ci/publish_report.py).
+          & $py @pyArgs "$src\scripts\ci\publish_report.py" `
+              --repo-dir $src `
+              --data-dir "$env:RUNNER_TEMP\net_probe_data" `
+              --template-dir "$src\scripts\ci\reports-branch" `
+              --task "net_probe" `
+              --error "Задача net_probe не оставила отчёт - смотрите шаг 'Run net_probe' в логе прогона" `
+              --message "net_probe: $env:GITHUB_REF_NAME @ $env:GITHUB_SHA (run $env:GITHUB_RUN_ID)"
+
+          if ($LASTEXITCODE -ne 0) { throw "publish_report вернул код $LASTEXITCODE" }

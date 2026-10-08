@@ -9,6 +9,30 @@
 
 import os
 
+
+def _load_local_env():
+    """Минимальная загрузка .env без внешних зависимостей.
+
+    Файл .env уже в .gitignore; удобно хранить там локальные API keys вроде
+    ThePornDB/StashBox, не экспортируя переменные каждый запуск.
+    """
+    path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_local_env()
+
 # ---------------------------------------------------------------------------
 # ФОРУМ
 # ---------------------------------------------------------------------------
@@ -157,6 +181,68 @@ MAX_TAG_SCENES = int(os.environ.get("MAX_TAG_SCENES", "15"))
 # более старые карточки сместятся).
 MAX_SCENE_ITEMS = int(os.environ.get("MAX_SCENE_ITEMS", "400"))
 
+# Источники, которые уже можно продолжать скрапить/держать в БД, но временно НЕ
+# показывать в пользовательских библиотеках (/deovr, /heresphere, PLAYA API).
+# Сейчас xxxclub скрыт по просьбе пользователя: вернём выдачу карточек позже,
+# когда отдельно проверим качество метаданных и поведение плееров.
+HIDDEN_LIBRARY_SITE_IDS = {
+    part.strip()
+    for part in os.environ.get("HIDDEN_LIBRARY_SITE_IDS", "xxxclub").split(",")
+    if part.strip()
+}
+
+# Внешние постеры актёров/логотипы студий для PLAY'A. По умолчанию пробуем
+# лениво подтягивать публичные изображения с VRSpy (актёры) и POVR (студии)
+# и кэшировать только URL в БД. Если внешние сайты недоступны или хочется
+# полностью офлайн-режим - поставьте 0.
+ENABLE_EXTERNAL_ENTITY_META = os.environ.get("ENABLE_EXTERNAL_ENTITY_META", "1").lower() not in ("0", "false", "no")
+EXTERNAL_ENTITY_META_TTL_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TTL_SEC", str(30 * 24 * 3600)))
+EXTERNAL_ENTITY_META_TIMEOUT_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TIMEOUT_SEC", "8"))
+POVR_BASE_URL = os.environ.get("POVR_BASE_URL", "https://povr.com")
+VRSPY_BASE_URL = os.environ.get("VRSPY_BASE_URL", "https://www.vrspy.com")
+VRPORN_BASE_URL = os.environ.get("VRPORN_BASE_URL", "https://vrporn.com")
+# Трейлерные карточки внешних PLAY'A-каталогов. Списки сцен кэшируются локально,
+# но подписанные media URL всегда запрашиваются заново при открытии карточки.
+ENABLE_EXTERNAL_TRAILERS = os.environ.get("ENABLE_EXTERNAL_TRAILERS", "1").lower() not in ("0", "false", "no")
+EXTERNAL_TRAILER_CATALOG_TTL_SEC = int(os.environ.get("EXTERNAL_TRAILER_CATALOG_TTL_SEC", str(24 * 3600)))
+# Опциональные структурированные metadata-провайдеры Stash-Box (например,
+# ThePornDB/StashDB). Формат env:
+# STASHBOX_METADATA_PROVIDERS="https://theporndb.net/graphql|API_KEY;https://stashdb.org/graphql|API_KEY"
+# Ключи не коммитим; переменная пустая по умолчанию.
+STASHBOX_METADATA_PROVIDERS = []
+for _raw_provider in os.environ.get("STASHBOX_METADATA_PROVIDERS", "").split(";"):
+    _raw_provider = _raw_provider.strip()
+    if not _raw_provider:
+        continue
+    if "|" in _raw_provider:
+        _endpoint, _api_key = _raw_provider.split("|", 1)
+    else:
+        _endpoint, _api_key = _raw_provider, ""
+    if _endpoint.strip():
+        STASHBOX_METADATA_PROVIDERS.append({"endpoint": _endpoint.strip(), "api_key": _api_key.strip()})
+
+# Локальный список актёров/студий (web UI + звёздочки/сортировка в PLAY'A).
+ENTITY_LIST_DEFAULT_NAME = os.environ.get("ENTITY_LIST_DEFAULT_NAME", "watchlist")
+
+# Публичный Knaben API используется как дополнительный meta-index: берём только
+# VR-похожие magnet/infohash с недавним lastSeen, реальными S>=2 и разумным
+# размером. Запросы разделяются точкой с запятой, чтобы названия могли содержать
+# обычные пробелы и запятые.
+ENABLE_KNABEN = os.environ.get("ENABLE_KNABEN", "1").lower() not in ("0", "false", "no")
+KNABEN_API_URL = os.environ.get("KNABEN_API_URL", "https://api.knaben.org/v1")
+KNABEN_QUERIES = [
+    value.strip()
+    for value in os.environ.get("KNABEN_QUERIES", "VR180").split(";")
+    if value.strip()
+]
+KNABEN_RESULTS_PER_QUERY = int(os.environ.get("KNABEN_RESULTS_PER_QUERY", "150"))
+KNABEN_MAX_IMPORT_ITEMS = int(os.environ.get("KNABEN_MAX_IMPORT_ITEMS", "150"))
+KNABEN_MIN_SEEDERS = int(os.environ.get("KNABEN_MIN_SEEDERS", "2"))
+KNABEN_MIN_SIZE_BYTES = int(os.environ.get("KNABEN_MIN_SIZE_BYTES", str(1024 ** 3)))
+KNABEN_MAX_SIZE_BYTES = int(os.environ.get("KNABEN_MAX_SIZE_BYTES", str(500 * 1024 ** 3)))
+KNABEN_LAST_SEEN_SEC = int(os.environ.get("KNABEN_LAST_SEEN_SEC", str(30 * 24 * 3600)))
+KNABEN_TIMEOUT_SEC = int(os.environ.get("KNABEN_TIMEOUT_SEC", "20"))
+
 REFRESH_INTERVAL_SEC = int(os.environ.get("REFRESH_INTERVAL_SEC", "3600"))
 
 # Сколько секунд переиспользовать уже полученный у TorrServe stream_url, не
@@ -289,5 +375,13 @@ FORUM_SITES = [
         "engine": "xxxclub",        # отдельный движок - обходится по-другому,
                                      # см. scraper._refresh_site_xxxclub()
         "impersonate": None,        # антибота нет - обычный requests, без curl_cffi
+    },
+    {
+        "id": "knaben",
+        "name": "Knaben",
+        "base_url": KNABEN_API_URL,
+        "engine": "knaben",
+        "cookie_file": "",
+        "id_prefix": "kn_",
     },
 ]
