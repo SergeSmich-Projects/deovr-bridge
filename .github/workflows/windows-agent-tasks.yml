@@ -1,0 +1,101 @@
+name: Windows agent tasks
+
+# Задачи выполняются на self-hosted раннере пользователя. Причина: у агента нет
+# доступа к внешней сети (кроме github.com/api.github.com/codeload), а логи и
+# артефакты Actions из его песочницы скачать нельзя. Поэтому единственный
+# читаемый им канал - git, и результат публикуется коммитом в ветку ci-reports,
+# а не в лог.
+#
+# Ограничения этой схемы (сознательные):
+#   * workflow должен существовать в ветке main - таково требование
+#     workflow_dispatch, поэтому перед первым запуском PR нужно смёржить;
+#   * НЕТ входных параметров: тело задачи берётся из кода репозитория, а не из
+#     строки, введённой человеком (это исключает инъекцию через inputs);
+#   * НЕТ secrets: задача не имеет доступа ни к каким секретам;
+#   * на диске задача трогает только RUNNER_TEMP и одноразовый клон раннера;
+#     ни cookies, ни .env, ни база проекта не читаются - см. scripts/ci/README.md.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # нужно ровно для одного: закоммитить отчёт в ветку ci-reports
+
+concurrency:
+  group: agent-tasks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  net-probe:
+    name: net_probe
+    runs-on: [self-hosted, Windows, X64, deovr-bridge]
+    timeout-minutes: 15
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Checkout task code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          path: src
+
+      - name: Run net_probe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\net_probe_data" | Out-Null
+
+          # Интерпретатор может называться по-разному; на этой машине Python
+          # есть (на нём работает само приложение), но не факт, что он в PATH
+          # раннера, поэтому ищем явно и падаем с понятным текстом.
+          $py = if (Get-Command python -ErrorAction SilentlyContinue) { "python" }
+                elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
+                elseif ($env:DEOVR_CI_PYTHON) { $env:DEOVR_CI_PYTHON }
+                else { throw "Python не найден в PATH раннера. Укажите полный путь в переменной окружения DEOVR_CI_PYTHON." }
+          $pyArgs = if ($py -eq "py") { @("-3") } else { @() }
+
+          Write-Host "Интерпретатор: $py $($pyArgs -join ' ')"
+          & $py @pyArgs --version
+
+          # requests нужен задаче; проверяем отдельно, чтобы ошибка была
+          # внятной, а не «ImportError» из глубины скрипта.
+          & $py @pyArgs -c "import requests; print('requests', requests.__version__)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "В интерпретаторе '$py' нет пакета requests. Установите: $py -m pip install requests"
+          }
+
+          & $py @pyArgs "src\scripts\ci\net_probe.py" `
+              --targets "src\scripts\ci\targets.json" `
+              --out-dir "$env:RUNNER_TEMP\net_probe_data"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "net_probe вернул код $LASTEXITCODE (см. вывод выше)"
+          }
+
+      - name: Publish report to ci-reports
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+          $py = if (Get-Command python -ErrorAction SilentlyContinue) { "python" }
+                elseif (Get-Command py -ErrorAction SilentlyContinue) { "py" }
+                elseif ($env:DEOVR_CI_PYTHON) { $env:DEOVR_CI_PYTHON }
+                else { throw "Python не найден в PATH раннера" }
+          $pyArgs = if ($py -eq "py") { @("-3") } else { @() }
+
+          # Публикация вынесена в python-скрипт: он покрыт локальным прогоном
+          # на настоящем git-репозитории (см. scripts/ci/publish_report.py).
+          & $py @pyArgs "src\scripts\ci\publish_report.py" `
+              --repo-dir "src" `
+              --data-dir "$env:RUNNER_TEMP\net_probe_data" `
+              --template-dir "src\scripts\ci\reports-branch" `
+              --task "net_probe" `
+              --error "Задача net_probe не оставила отчёт - смотрите шаг 'Run net_probe' в логе прогона" `
+              --message "net_probe: $env:GITHUB_REF_NAME @ $env:GITHUB_SHA (run $env:GITHUB_RUN_ID)"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "publish_report вернул код $LASTEXITCODE"
+          }
