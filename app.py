@@ -3227,7 +3227,8 @@ def playa_video_detail(item_id):
             links = []
             for link in detail.get("links", []):
                 links.append({
-                    "is_stream": link.get("is_stream", False),
+                    "is_stream": link.get("is_stream", True),  # По умолчанию True для трейлеров
+                    "is_download": link.get("is_download", False),
                     "url": link.get("url", ""),
                     "projection": link.get("projection", "180"),
                     "stereo": link.get("stereo", "LR"),
@@ -3239,6 +3240,8 @@ def playa_video_detail(item_id):
                 detail_obj["links"] = links
             
             details.append(detail_obj)
+        
+        log.info("POVR details: %d деталей с трейлерами", len([d for d in details if d.get("type") == "trailer"]))
         
         return _playa_response({
             "id": item_id,
@@ -3388,7 +3391,8 @@ def playa_video_detail(item_id):
                     continue
                 
                 link_obj = {
-                    "is_stream": link.get("is_stream", False),
+                    "is_stream": link.get("is_stream", True),  # По умолчанию True для трейлеров
+                    "is_download": link.get("is_download", False),
                     "url": link.get("url", ""),
                     "projection": link.get("projection", "180"),
                     "stereo": link.get("stereo", "LR"),
@@ -3396,16 +3400,14 @@ def playa_video_detail(item_id):
                     "quality_order": link.get("quality_order", 0),
                 }
                 
-                # Добавляем is_download если есть
-                if "is_download" in link:
-                    link_obj["is_download"] = link.get("is_download", False)
-                
                 links.append(link_obj)
             
             if links:
                 detail_obj["links"] = links
             
             details.append(detail_obj)
+        
+        log.info("VRPorn details: %d деталей с трейлерами", len([d for d in details if d.get("type") == "trailer"]))
         
         # Добавляем полное видео из локальной БД если найдено
         # ВАЖНО: добавляем ПЕРВЫМ, чтобы PLAY'a выбрала full
