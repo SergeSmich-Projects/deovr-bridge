@@ -56,11 +56,11 @@ def get_povr_videos(page_index=0, page_size=12, order="newest", actor_id=None, *
         
         data = client.get_json("videos", params)
         
-        # Преобразуем в формат PLAY'a
+        # Преобразуем в формат PLAY'a — добавляем префикс povr_ к ID
         content = []
         for item in data.get("content", []):
             content.append({
-                "id": str(item.get("id", "")),
+                "id": f"povr_{item.get('id', '')}",
                 "title": item.get("title", ""),
                 "subtitle": item.get("subtitle", ""),
                 "preview_image": item.get("preview_image", ""),

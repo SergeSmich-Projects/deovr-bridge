@@ -3476,6 +3476,64 @@ def playa_video_detail(item_id):
     # PLAY'A может прийти сюда из actor/studio matching-выдачи скрытого источника.
     item = store.get_item(item_id)
     if not item:
+        # Fallback для числовых ID — пробуем найти в VRPorn/POVR каталоге
+        if item_id.isdigit():
+            from matcher import PlayaCatalogDB
+            import os
+            db_path = os.path.join(os.path.dirname(__file__), "playa_catalog.db")
+            if os.path.exists(db_path):
+                try:
+                    db = PlayaCatalogDB(db_path)
+                    rec = db.get_video_by_id(item_id)
+                    if rec:
+                        # Формируем ответ из записи каталога
+                        site = rec.site
+                        # Определяем provider
+                        provider = "vrporn" if "vrporn" in site.lower() else "povr"
+                        # Получаем details с links через API
+                        matcher_inst = _get_matcher()
+                        if matcher_inst:
+                            api_data = matcher_inst.get_video_links(site, item_id)
+                            if api_data:
+                                details_list = []
+                                for detail in api_data.get('details', []):
+                                    detail_obj = {
+                                        "type": detail.get("type", "trailer"),
+                                        "duration_seconds": detail.get("duration_seconds", 0),
+                                    }
+                                    links = []
+                                    for link in detail.get("links", []):
+                                        if link.get("unavailable_reason"):
+                                            continue
+                                        links.append({
+                                            "is_stream": link.get("is_stream", True),
+                                            "url": link.get("url", ""),
+                                            "projection": link.get("projection", "180"),
+                                            "stereo": link.get("stereo", "LR"),
+                                            "quality_name": link.get("quality_name", "HD"),
+                                            "quality_order": link.get("quality_order", 0),
+                                        })
+                                    if links:
+                                        detail_obj["links"] = links
+                                    details_list.append(detail_obj)
+                                
+                                return _playa_response({
+                                    "id": item_id,
+                                    "title": rec.title,
+                                    "subtitle": rec.studio,
+                                    "status": "TRAILER",
+                                    "description": "",
+                                    "preview_image": rec.preview_image,
+                                    "release_date": rec.release_date,
+                                    "studio": {"id": "", "title": rec.studio} if rec.studio else None,
+                                    "categories": [],
+                                    "actors": [],
+                                    "views": 0,
+                                    "has_scripts": False,
+                                    "details": details_list,
+                                })
+                except Exception as e:
+                    log.debug("Fallback video lookup failed for %s: %s", item_id, e)
         return _playa_not_found("Video not found")
     return _playa_response(_playa_video_view(item, _base_url()))
 

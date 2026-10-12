@@ -621,6 +621,34 @@ class PlayaCatalogDB:
             return cur.execute("SELECT COUNT(*) FROM videos WHERE site = ?", (site,)).fetchone()[0]
         return cur.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
 
+    def get_video_by_id(self, video_id: str) -> Optional[ApiVideoRecord]:
+        """Найти видео по ID в локальном каталоге."""
+        cur = self.conn.cursor()
+        row = cur.execute(
+            "SELECT site, video_id, title, title_norm, title_clean_norm, studio, studio_norm, "
+            "release_date, release_year, duration_seconds, preview_image, preview_slug_norm, "
+            "actors_json, details_fetched FROM videos WHERE video_id = ? LIMIT 1",
+            (str(video_id),)
+        ).fetchone()
+        if not row:
+            return None
+        return ApiVideoRecord(
+            site=row["site"],
+            video_id=row["video_id"],
+            title=row["title"],
+            title_norm=row["title_norm"],
+            title_clean_norm=row["title_clean_norm"],
+            studio=row["studio"],
+            studio_norm=row["studio_norm"],
+            release_date=int(row["release_date"] or 0),
+            release_year=int(row["release_year"] or 0),
+            duration_seconds=int(row["duration_seconds"] or 0),
+            preview_image=row["preview_image"],
+            preview_slug_norm=row["preview_slug_norm"],
+            actors_json=row["actors_json"] or "[]",
+            details_fetched=int(row["details_fetched"] or 0),
+        )
+
 
 class PlayaApiClient:
     """
