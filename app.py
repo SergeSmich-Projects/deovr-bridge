@@ -3929,18 +3929,19 @@ def match_all():
         # Сохраняем результаты
         matched_count = 0
         failed_count = 0
-        for item, matches in zip(local_items, results):
+        for item, result in zip(local_items, results):
             item_id = str(item.get('id', ''))
-            if matches and len(matches) > 0:
-                best = matches[0]
-                confidence = best.get('confidence', 0)
+            
+            # Проверяем лучший результат
+            best_match = result.get('best_match')
+            if best_match and best_match.get('status') == 'auto_matched':
+                confidence = best_match.get('confidence', 0)
                 
                 if confidence >= 80.0:
-                    video = best.get('video', {})
                     store.save_match_cache(
                         item_id=item_id,
-                        provider=video.get('site', ''),
-                        external_id=video.get('video_id', ''),
+                        provider=best_match.get('site', ''),
+                        external_id=best_match.get('video_id', ''),
                         match_score=int(confidence * 10),
                         match_type='full_with_trailer',
                         auto_matched=True,
