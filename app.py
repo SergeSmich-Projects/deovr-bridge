@@ -42,6 +42,9 @@ import scraper
 import torrserve
 import matcher
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("app")
+
 try:
     import povr_parser
     POVR_AVAILABLE = True
@@ -56,9 +59,6 @@ else:
     povr_parser_instance = None
 
 POVR_PREFIX = "povr_"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("app")
 
 app = Flask(__name__)
 store.init_db()
