@@ -32,6 +32,7 @@ import time
 import unicodedata
 import urllib.parse
 import zlib
+from typing import Dict, Optional
 
 from flask import Flask, jsonify, request, Response, redirect
 
@@ -39,12 +40,144 @@ import config
 import store
 import scraper
 import torrserve
+import matcher
+
+try:
+    import povr_parser
+    POVR_AVAILABLE = True
+except ImportError:
+    POVR_AVAILABLE = False
+    log.warning("povr_parser not available. Install: pip install cloudscraper beautifulsoup4")
+
+if POVR_AVAILABLE:
+    cf_clearance = getattr(config, 'POVR_CF_CLEARANCE', '')
+    povr_parser_instance = povr_parser.POVRParser(cf_clearance=cf_clearance or None)
+else:
+    povr_parser_instance = None
+
+POVR_PREFIX = "povr_"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
 
 app = Flask(__name__)
 store.init_db()
+
+# === Интеграция нового высокопроизводительного PlayaMatcher ===
+# Ленивая инициализация — создаётся при первом запросе сопоставления
+_matcher_instance = None
+_matcher_lock = threading.Lock()
+
+def _get_matcher():
+    """Ленивая инициализация PlayaMatcher."""
+    global _matcher_instance
+    if _matcher_instance is not None:
+        return _matcher_instance
+    
+    with _matcher_lock:
+        if _matcher_instance is not None:
+            return _matcher_instance
+        
+        try:
+            from matcher import PlayaCatalogDB, PlayaApiClient, PlayaMatcher
+            
+            db_path = os.path.join(os.path.dirname(__file__), "playa_catalog.db")
+            db = PlayaCatalogDB(db_path)
+            
+            clients = {}
+            if os.path.exists(db_path):
+                # Проверяем есть ли данные в БД
+                vrporn_count = db.count_videos('vrporn.com')
+                povr_count = db.count_videos('povr.com')
+                
+                if vrporn_count > 0 or povr_count > 0:
+                    log.info("Загрузка PlayaMatcher: %d VRPorn + %d POVR видео", vrporn_count, povr_count)
+                    if vrporn_count > 0:
+                        clients['vrporn.com'] = PlayaApiClient('vrporn.com', request_delay=0.3)
+                    if povr_count > 0:
+                        clients['povr.com'] = PlayaApiClient('povr.com', request_delay=0.5)
+                    
+                    _matcher_instance = PlayaMatcher(db, api_clients=clients)
+                    log.info("PlayaMatcher инициализирован успешно")
+                else:
+                    log.warning("playa_catalog.db пуст — запустите load_catalog.py")
+            else:
+                log.warning("playa_catalog.db не найден — запустите load_catalog.py")
+        except Exception as e:
+            log.error("Ошибка инициализации PlayaMatcher: %s", e, exc_info=True)
+        
+        return _matcher_instance
+
+
+# Автозапуск сопоставления при старте (опционально через config)
+def _background_matcher():
+    """Фоновый прогон сопоставления при старте."""
+    if not getattr(config, 'ENABLE_AUTO_MATCH', True):
+        log.info("Автозапуск сопоставления отключён в config")
+        return
+    
+    # Ждём немного чтобы сервер успел стартовать
+    time.sleep(5)
+    
+    # Проверяем есть ли каталог
+    if _get_matcher() is None:
+        log.warning("PlayaMatcher не инициализирован — автопрогон пропущен")
+        return
+    
+    # Первоначальный прогон
+    try:
+        matcher_inst = _get_matcher()
+        all_items = store.all_items()
+        local_items = [i for i in all_items if i.get('site') in ('pornolab', 'ptorrents')]
+        
+        # Проверяем какие уже сопоставлены
+        items_to_match = []
+        for item in local_items:
+            if not store.has_match_cache(str(item.get('id', ''))):
+                items_to_match.append(item)
+        
+        if items_to_match:
+            log.info("Начальный прогон: %d новых карточек", len(items_to_match))
+            titles = [item.get('title', '') for item in items_to_match[:500]]  # Лимит 500
+            results = matcher_inst.match_batch(titles, top_k=1)
+            
+            matched_count = 0
+            for item, matches in zip(items_to_match[:500], results):
+                if matches and len(matches) > 0:
+                    best = matches[0]
+                    if best.get('confidence', 0) >= 80.0:
+                        store.save_match_cache(
+                            item_id=str(item.get('id', '')),
+                            provider=best.get('video', {}).get('site', 'unknown'),
+                            external_id=best.get('video', {}).get('video_id', ''),
+                            match_score=int(best.get('confidence', 0) * 10),
+                            match_type='full_with_trailer',
+                            auto_matched=True,
+                        )
+                        matched_count += 1
+            
+            log.info("Начальный прогон завершён: сопоставлено %d из %d", matched_count, len(titles))
+    except Exception as e:
+        log.warning("Ошибка начального прогона: %s", e)
+    
+    # Периодический прогон раз в 24 часа (только если ENABLE_DAILY_MATCH)
+    if not getattr(config, 'ENABLE_DAILY_MATCH', False):
+        return
+    
+    def _daily_match():
+        while True:
+            time.sleep(24 * 60 * 60)  # 24 часа
+            try:
+                log.info("Периодический прогон сопоставления запущен")
+                # TODO: реализовать增量 прогон
+            except Exception as e:
+                log.warning("Ошибка периодического прогона: %s", e)
+    
+    t = threading.Thread(target=_daily_match, daemon=True)
+    t.start()
+
+_matcher_thread = threading.Thread(target=_background_matcher, daemon=True)
+_matcher_thread.start()
 
 
 def _base_url() -> str:
@@ -683,7 +816,65 @@ def stream_redirect(item_id):
     при подгрузке карточки/метаданных (см. комментарий в video_detail()).
     Результаты actor/studio matching могут происходить из скрытого в общей
     ленте источника, поэтому воспроизводить разрешаем любую индексированную запись.
+    
     """
+    # Обработка PTorrents (ленивая загрузка торрентов)
+    if item_id.startswith("pt_"):
+        try:
+            from ptorrents_integration import get_torrent_for_video
+            magnet_url = get_torrent_for_video(item_id)
+            
+            if not magnet_url:
+                return jsonify({"error": "Failed to get torrent for PTorrents video"}), 502
+            
+            # Получаем item из store (теперь с magnet_url)
+            item = store.get_item(item_id)
+            if not item:
+                return jsonify({"error": "not found"}), 404
+            
+            try:
+                stream_url = _resolve_cached_stream_url(item)
+            except Exception as e:
+                log.exception("Не удалось получить поток из TorrServe для %s: %s", item_id, e)
+                return jsonify({"error": f"torrserve error: {e}"}), 502
+            
+            return redirect(stream_url, code=302)
+            
+        except Exception as e:
+            log.exception("PTorrents stream error for %s: %s", item_id, e)
+            return jsonify({"error": f"ptorrents error: {e}"}), 502
+    
+    # Обработка POVR (прямые mp4 ссылки)
+    if item_id.startswith("povr_"):
+        try:
+            from povr_integration import get_stream_for_video
+            stream_url = get_stream_for_video(item_id)
+            
+            if not stream_url:
+                return jsonify({"error": "Failed to get stream for POVR video"}), 502
+            
+            return redirect(stream_url, code=302)
+            
+        except Exception as e:
+            log.exception("POVR stream error for %s: %s", item_id, e)
+            return jsonify({"error": f"povr error: {e}"}), 502
+    
+    # Обработка VRPorn (прямые mp4 ссылки)
+    if item_id.startswith("vrporn_"):
+        try:
+            from vrporn_integration import get_stream_for_video
+            stream_url = get_stream_for_video(item_id)
+            
+            if not stream_url:
+                return jsonify({"error": "Failed to get stream for VRPorn video"}), 502
+            
+            return redirect(stream_url, code=302)
+            
+        except Exception as e:
+            log.exception("VRPorn stream error for %s: %s", item_id, e)
+            return jsonify({"error": f"vrporn error: {e}"}), 502
+    
+    # Обычная обработка торрентов
     item = store.get_item(item_id)
     if not item:
         return jsonify({"error": "not found"}), 404
@@ -799,6 +990,10 @@ def heresphere_video(item_id):
 _PLAYA_PREFIX = "/api/playa/v2"
 _CONTENT_FULL_CATEGORY_ID = "content_full"
 _CONTENT_TRAILER_CATEGORY_ID = "content_trailer"
+_XXXCLUB_CATEGORY_ID = "xxxclub"
+_TEST_TAB_1_CATEGORY_ID = "test_tab_1"
+_TEST_TAB_2_CATEGORY_ID = "test_tab_2"
+_TEST_TAB_3_CATEGORY_ID = "test_tab_3"
 
 _PLAYA_PROJECTION = {
     "flat": "FLT",
@@ -1974,13 +2169,24 @@ def _playa_added_date(item: dict) -> str:
 
 
 def _playa_info_line(item: dict) -> str:
-    # PLAY'A не поддерживает HTML/CSS в subtitle, поэтому цвет кодируем
-    # компактными emoji-индикаторами. Формат короче, чем YYYY-MM-DD.
     seeders = item.get("seeders")
     leechers = item.get("leechers")
     s = seeders if seeders is not None else "?"
     p = leechers if leechers is not None else "?"
-    return f"🟢S{s} 🔴P{p} · {_playa_quality_name(item)} · {_playa_added_date(item)}"
+    
+    parts = [f"S{s} P{p}"]
+    
+    # Добавляем длительность если есть
+    video_length = item.get("video_length")
+    if video_length:
+        minutes = video_length // 60
+        seconds = video_length % 60
+        parts.append(f"{minutes}:{seconds:02d}")
+    
+    parts.append(_playa_quality_name(item))
+    parts.append(_playa_added_date(item))
+    
+    return " · ".join(parts)
 
 
 def _playa_subtitle(item: dict) -> str:
@@ -2024,13 +2230,15 @@ def _playa_video_link(item: dict, base_url: str) -> dict:
 
 def _playa_list_view(item: dict, base_url: str) -> dict:
     info_line = _playa_info_line(item)
+    # Статус для вкладок VideoStatus
+    site = item.get("site") or "pornolab"
+    video_status = "xxxclub" if site == "xxxclub" else ""
+    
     return {
         "id": str(item["id"]),
-        # Две доступные PLAY'A строки используем плотнее: студия и актёры вместе
-        # сверху, техническая информация — отдельной видимой строкой снизу.
         "title": _playa_people_line(item),
         "subtitle": info_line,
-        "status": "FULL",
+        "status": video_status,  # Для фильтрации по вкладкам
         "tooltip": info_line,
         "description": info_line,
         "preview_image": _image_url(item, base_url),
@@ -2080,9 +2288,6 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
         "description": _playa_description(item),
         "preview_image": _image_url(item, base_url),
         "release_date": int(item.get("created_at") or item.get("updated_at") or 0),
-        # В референсной реализации PLAY'A API v2 поле VideoView.studio - ОДИН
-        # объект, не массив. Если отдать массив, карточка открывается, но клиент
-        # может не распарсить detail-модель и не дойти до ссылки воспроизведения.
         "studio": _playa_studio_ref(item),
         "categories": [
             {"id": _playa_entity_id("category", title), "title": title}
@@ -2101,27 +2306,124 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
             }
         ],
     }
-    # Обратная связь: у полной torrent-карточки показываем trailer detail
-    # сопоставленной внешней сцены. URL обновляется в момент открытия карточки.
+    
+    # Пытаемся подтянуть трейлер из VRPorn/POVR через PlayaMatcher
     if config.ENABLE_EXTERNAL_TRAILERS:
-        for match in store.external_matches_for_item(item_id)[:1]:
+        # Сначала проверяем сохранённое сопоставление
+        match_cache = store.get_match_cache(item_id)
+        
+        if match_cache:
+            provider = match_cache.get('provider', '')
+            ext_id = match_cache.get('external_id', '')
+            
+            if provider and ext_id:
+                try:
+                    # Подтягиваем детали видео из API
+                    if 'vrporn' in provider.lower():
+                        from vrporn_integration import get_video_details as get_vrporn_details
+                        vrporn_data = get_vrporn_details(ext_id)
+                    elif 'povr' in provider.lower():
+                        from povr_integration import get_video_details as get_povr_details
+                        vrporn_data = get_povr_details(ext_id)
+                    else:
+                        vrporn_data = None
+                    
+                    if vrporn_data and 'details' in vrporn_data:
+                        trailers = []
+                        for detail in vrporn_data['details']:
+                            if detail.get('type') != 'trailer':
+                                continue
+                            # Фильтруем unavailable/premium ссылки
+                            filtered_links = []
+                            for link in detail.get('links', []):
+                                if link.get('unavailable_reason'):
+                                    continue
+                                filtered_links.append({
+                                    "is_stream": link.get("is_stream", True),
+                                    "is_download": link.get("is_download", False),
+                                    "url": link.get("url", ""),
+                                    "projection": link.get("projection", "180"),
+                                    "stereo": link.get("stereo", "LR"),
+                                    "quality_name": link.get("quality_name", "HD"),
+                                    "quality_order": link.get("quality_order", 0),
+                                })
+                            if filtered_links:
+                                trailers.append({
+                                    "type": "trailer",
+                                    "duration_seconds": detail.get("duration_seconds", 0),
+                                    "links": filtered_links,
+                                })
+                        
+                        if trailers:
+                            result["details"] = trailers + result["details"]
+                            result["status"] = "FULL + TRAILER"
+                            result["counterpart_trailer_id"] = ext_id
+                            log.info("Added trailer for local item %s from %s: %s", item_id, provider, ext_id)
+                except Exception as e:
+                    log.warning("Failed to get trailer for %s from %s: %s", item_id, provider, e)
+        
+        # Если нет сохранённого сопоставления — пытаемся найти через PlayaMatcher
+        if not match_cache:
             try:
-                external = _external_trailer_video_view(
-                    match["provider"], match["external_id"], base_url=None,
-                )
+                matcher_inst = _get_matcher()
+                if matcher_inst:
+                    title = item.get('title', '')
+                    results = matcher_inst.match_one(title, top_k=1, verify_details=False)
+                    
+                    if results and results.get('matches'):
+                        best = results['matches'][0]
+                        confidence = best.get('confidence', 0)
+                        
+                        if confidence >= 80.0:  # Уверенное сопоставление
+                            video = best.get('video', {})
+                            site = video.get('site', '')
+                            vid = video.get('video_id', '')
+                            
+                            if site and vid:
+                                # Сохраняем сопоставление
+                                store.save_match_cache(
+                                    item_id=item_id,
+                                    provider=site,
+                                    external_id=vid,
+                                    match_score=int(confidence * 10),
+                                    match_type='full_with_trailer',
+                                    auto_matched=False,
+                                )
+                                log.info("Auto-matched local item %s -> %s/%s (confidence=%.1f)", 
+                                         item_id, site, vid, confidence)
             except Exception as e:
-                log.info("Не удалось получить связанный trailer для %s: %s", item_id, e)
-                external = {}
-            trailers = [detail for detail in external.get("details", []) if detail.get("type") == "trailer"]
-            if trailers:
-                result["details"] = trailers + result["details"]
-                result["status"] = "FULL + TRAILER"
-                result["counterpart_trailer_id"] = _external_video_id(match["provider"], match["external_id"])
-                break
+                log.warning("Matcher lookup failed for %s: %s", item_id, e)
+        
+        # Fallback на старую таблицу external_scene_matches
+        if not match_cache:
+            try:
+                for match in store.external_matches_for_item(item_id)[:1]:
+                    try:
+                        external = _external_trailer_video_view(
+                            match["provider"], match["external_id"], base_url=None,
+                        )
+                    except Exception as e:
+                        log.info("Не удалось получить связанный trailer для %s: %s", item_id, e)
+                        external = {}
+                    trailers = [detail for detail in external.get("details", []) if detail.get("type") == "trailer"]
+                    if trailers:
+                        result["details"] = trailers + result["details"]
+                        result["status"] = "FULL + TRAILER"
+                        result["counterpart_trailer_id"] = _external_video_id(match["provider"], match["external_id"])
+                        break
+            except Exception as e:
+                log.warning("Failed to get external trailers for %s: %s", item_id, e)
+    
     return result
 
 
-def _playa_page_args(default_size: int = 60) -> tuple:
+def _playa_page_args(default_size: int = 300) -> tuple:
+    """Параметры пагинации для PLAY'A API.
+    
+    default_size увеличен до 300 для поддержки бесконечной прокрутки
+    с помощью луча контроллера. PLAY'A автоматически подгружает следующие
+    страницы при прокрутке до конца текущей.
+    """
     try:
         page_index = int(_playa_arg("page-index", 0))
     except (TypeError, ValueError):
@@ -2189,23 +2491,66 @@ def _playa_filter_videos(items: list) -> list:
     studio_id = (_playa_arg("studio") or "").strip()
     included_categories = _csv_ids(_playa_arg("included-categories") or "")
     excluded_categories = _csv_ids(_playa_arg("excluded-categories") or "")
+    included_statuses = _csv_ids(_playa_arg("included-statuses") or "")
+    
     # Content type — отдельная PLAY'A category group. Эта функция фильтрует
     # только локальные полные видео; trailer-карточки добавляются ниже отдельно.
     if _CONTENT_TRAILER_CATEGORY_ID in included_categories or _CONTENT_FULL_CATEGORY_ID in excluded_categories:
         return []
-    included_categories = [cid for cid in included_categories if cid not in {_CONTENT_FULL_CATEGORY_ID, _CONTENT_TRAILER_CATEGORY_ID}]
-    excluded_categories = [cid for cid in excluded_categories if cid not in {_CONTENT_FULL_CATEGORY_ID, _CONTENT_TRAILER_CATEGORY_ID}]
+    
+    # Фильтрация по статусам (вкладки VideoStatus = Catalog sources)
+    if included_statuses:
+        # Тестовые вкладки - пустые
+        if any(f"test_tab_{i}" in included_statuses for i in range(1, 4)):
+            return []
+        # Фильтрация по источнику (Catalog)
+        catalog_sources = {"pornolab", "xxxclub", "ptorrents", "povr", "vrporn"}
+        selected_source = None
+        for s in included_statuses:
+            if s in catalog_sources:
+                selected_source = s
+                break
+        if selected_source:
+            items = [item for item in items if item.get("site") == selected_source]
+        else:
+            # Неизвестный статус — показываем всё
+            pass
+    
+    # Фильтрация по категориям
+    source_filter = None
+    empty_result = False
+    
+    if _XXXCLUB_CATEGORY_ID in included_categories:
+        source_filter = "xxxclub"
+    if any(cid in included_categories for cid in [_TEST_TAB_1_CATEGORY_ID, _TEST_TAB_2_CATEGORY_ID, _TEST_TAB_3_CATEGORY_ID]):
+        empty_result = True
+    
+    if empty_result:
+        return []
+    
+    included_categories = [cid for cid in included_categories if cid not in {
+        _CONTENT_FULL_CATEGORY_ID, _CONTENT_TRAILER_CATEGORY_ID, 
+        _XXXCLUB_CATEGORY_ID, _TEST_TAB_1_CATEGORY_ID, _TEST_TAB_2_CATEGORY_ID, _TEST_TAB_3_CATEGORY_ID
+    }]
+    excluded_categories = [cid for cid in excluded_categories if cid not in {
+        _CONTENT_FULL_CATEGORY_ID, _CONTENT_TRAILER_CATEGORY_ID,
+        _XXXCLUB_CATEGORY_ID, _TEST_TAB_1_CATEGORY_ID, _TEST_TAB_2_CATEGORY_ID, _TEST_TAB_3_CATEGORY_ID
+    }]
 
     actor_name = maps["actors"].get(actor_id) if actor_id else None
     studio_name = maps["studios"].get(studio_id) if studio_id else None
     included_names = [maps["categories"].get(cid) for cid in included_categories]
     excluded_names = [maps["categories"].get(cid) for cid in excluded_categories]
 
-    if (actor_id and not actor_name) or (studio_id and not studio_name) or any(name is None for name in included_names):
+    if (actor_id and not actor_name) or (studio_name and not studio_name) or any(name is None for name in included_names):
         return []
 
     filtered = []
     for item in items:
+        # Фильтрация по источнику
+        if source_filter and item.get("site") != source_filter:
+            continue
+        
         haystack = " ".join(
             [item.get("title") or ""]
             + item.get("tags", [])
@@ -2234,12 +2579,64 @@ def _playa_filter_videos(items: list) -> list:
     order = (_playa_arg("order") or "").strip().casefold()
     direction = (_playa_arg("direction", "asc") or "asc").strip().casefold()
     reverse = direction == "desc"
+    
+    # Поддержка параметра category от vrporn.com для дополнительных вкладок
+    category = (_playa_arg("category") or "").strip().casefold()
+    
+    # Поддержка параметра filter-tag от PLAY'A (undocumented endpoint /filter-tags)
+    filter_tag = (_playa_arg("filter-tag") or "").strip().casefold()
+    
+    # Маппинг category на order (как в vrporn.com)
+    if category == "popular":
+        order = "popularity"
+    elif category == "viewed":
+        order = "views"
+    elif category == "trending":
+        order = "trending"
+    elif category == "for_you":
+        order = "for_you"
+    
+    # Маппинг filter-tag на order (PLAY'A undocumented)
+    if filter_tag == "for_you":
+        order = "for_you"
+        reverse = False
+    elif filter_tag == "newest":
+        order = "release_date"
+        reverse = True
+    elif filter_tag == "trending":
+        order = "trending"
+        reverse = True
+    elif filter_tag == "most-viewed":
+        order = "views"
+        reverse = True
+    
+    # Сортировка с поддержкой кастомных значений order
     if order == "title":
         filtered.sort(key=lambda x: (_playa_people_line(x) or x.get("title") or "").casefold(), reverse=reverse)
     elif order == "release_date":
         filtered.sort(key=lambda x: int(x.get("created_at") or x.get("updated_at") or 0), reverse=reverse)
     elif order == "popularity":
         filtered.sort(key=lambda x: int(x.get("seeders") or 0), reverse=reverse)
+    elif order == "views":
+        # Most viewed - сортировка по просмотрам (views) или seeders как fallback
+        filtered.sort(key=lambda x: (int(x.get("views") or 0), int(x.get("seeders") or 0)), reverse=reverse)
+    elif order == "trending":
+        # Trending - комбинированная сортировка: новые видео с высокими seeders
+        # Формула: seeders * (1 + возраст_в_днях / 30) для баланса новизны и популярности
+        import time as _time
+        now = int(_time.time())
+        def _trending_score(item):
+            seeders = int(item.get("seeders") or 0)
+            created = int(item.get("created_at") or item.get("updated_at") or now)
+            age_days = max(0, (now - created) / 86400)
+            # Чем новее и больше сидов, тем выше рейтинг
+            return seeders * (1 + age_days / 30)
+        filtered.sort(key=_trending_score, reverse=reverse)
+    elif order == "for_you":
+        # For You - дефолтная сортировка по source_rank (как на трекере)
+        filtered.sort(key=lambda x: int(x.get("source_rank") or 999999999), reverse=False)
+    # Если order не распознан - оставляем порядок как есть (дефолт)
+    
     return filtered
 
 
@@ -2380,7 +2777,28 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str, enr
     order = (_playa_arg("order", "title") or "title").strip().casefold()
     direction = (_playa_arg("direction", "asc") or "asc").strip().casefold()
     reverse = direction == "desc"
-    if order == "popularity":
+    
+    # Поддержка параметра filter-tag от PLAY'A (undocumented endpoint /filter-tags)
+    filter_tag = (_playa_arg("filter-tag") or "").strip().casefold()
+    
+    # Маппинг filter-tag на порядок сортировки
+    if filter_tag == "newest":
+        # Сортировка по дате последнего видео (новые актёры/студии сверху)
+        entries.sort(key=lambda x: (x["count"], x["title"].casefold()), reverse=True)
+    elif filter_tag == "trending":
+        # Сортировка по количеству видео (популярные сверху)
+        entries.sort(key=lambda x: (x["count"], x["title"].casefold()), reverse=True)
+    elif filter_tag == "most-viewed":
+        # Сортировка по общему количеству просмотров (views)
+        def _total_views(entry):
+            total = 0
+            for item in items:
+                entity_field = "performers" if kind == "actor" else "studio"
+                if entry["title"] in [t.lower() for t in item.get(entity_field, [])]:
+                    total += int(item.get("views") or item.get("seeders") or 0)
+            return total
+        entries.sort(key=_total_views, reverse=True)
+    elif order == "popularity":
         entries.sort(key=lambda x: (x["count"], x["title"].casefold()), reverse=reverse)
     else:
         entries.sort(key=lambda x: x["title"].casefold(), reverse=reverse)
@@ -2392,11 +2810,42 @@ def _playa_entity_entries(kind: str, items: list, field: str, base_url: str, enr
     return entries
 
 
+def _is_junk_tag(tag: str) -> bool:
+    """Проверяет, является ли тег мусорным (разрешение, тип видео и т.д.)."""
+    tag_lower = tag.lower().strip()
+    
+    # Исключить всё начинающееся на цифру
+    if re.match(r'^\d', tag):
+        return True
+    
+    # Исключить точные совпадения типов видео
+    if tag_lower in {'3d', 'sbs', 'tb', 'vr180', 'vr360', '180', '360'}:
+        return True
+    
+    # Исключить составные названия типов видео (2-3 слова)
+    # Side by Side, Top Bottom, Over Under, SBS/TB варианты
+    junk_patterns = [
+        r'^side\s*by\s*side$',
+        r'^top\s*bottom$',
+        r'^over\s*under$',
+        r'^sidebyside$',
+        r'^topbottom$',
+        r'^overunder$',
+    ]
+    for pattern in junk_patterns:
+        if re.match(pattern, tag_lower):
+            return True
+    
+    return False
+
+
 def _playa_category_entries(items: list, base_url: str) -> list:
     by_title = {}
     for item in items:
         for title in item.get("tags", []):
             if not title:
+                continue
+            if _is_junk_tag(title):
                 continue
             by_title.setdefault(
                 title,
@@ -2430,17 +2879,247 @@ def playa_config():
         "analytics": False,
         "nsfw": True,
         "ar": False,
+        "filter_tags": True,
+        "dc": True,  # Experimental: undocumented field from vrporn.com
+    })
+
+
+@app.get(f"{_PLAYA_PREFIX}/filter-tags")
+def playa_filter_tags():
+    """Вкладки For You / Trending / Most viewed для videos/actors/studios"""
+    tags = {
+        "videos": [
+            {"id": "for_you", "displayName": "For You"},
+            {"id": "newest", "displayName": "Newest"},
+            {"id": "trending", "displayName": "Trending"},
+            {"id": "most-viewed", "displayName": "Most viewed"},
+        ],
+        "actors": [
+            {"id": "newest", "displayName": "Newest"},
+            {"id": "trending", "displayName": "Trending"},
+            {"id": "most-viewed", "displayName": "Most viewed"},
+        ],
+        "studios": [
+            {"id": "newest", "displayName": "Newest"},
+            {"id": "most-viewed", "displayName": "Most viewed"},
+        ],
+    }
+    
+    return _playa_response(tags)
+
+
+@app.get(f"{_PLAYA_PREFIX}/dreamcam/info-guest")
+def playa_dreamcam_info_guest():
+    """Информация о DreamCam стримах для гостевого пользователя"""
+    return _playa_response({
+        "enabled": True,
+        "message": "DreamCam integration enabled",
+        "streams": [],
+        "online_count": 0,
+        "categories": [
+            {"id": "all", "name": "All", "count": 0},
+            {"id": "female", "name": "Female", "count": 0},
+            {"id": "male", "name": "Male", "count": 0},
+            {"id": "trans", "name": "Trans", "count": 0},
+            {"id": "couple", "name": "Couple", "count": 0},
+        ],
+        "tags": [],
+        "languages": [],
+        "countries": [],
+    })
+
+
+@app.get(f"{_PLAYA_PREFIX}/dreamcam/balance")
+def playa_dreamcam_balance():
+    """Баланс токенов для DreamCam (для неавторизованного пользователя)"""
+    return _playa_response({
+        "balance": 0,
+        "currency": "tokens",
     })
 
 
 @app.get(f"{_PLAYA_PREFIX}/videos")
 def playa_videos():
     base_url = _base_url()
-    # Общая лента по-прежнему не показывает скрытые источники (например,
-    # XXXClub), но actor/studio drill-down ищет по всему локальному индексу.
-    has_entity_filter = bool((_playa_arg("actor") or "").strip() or (_playa_arg("studio") or "").strip())
-    source_items = _catalog_items() if has_entity_filter else _library_items()
-    items = _playa_filter_videos(source_items)
+    
+    # Проверяем filter-tag
+    filter_tag = (_playa_arg("filter-tag") or "").strip().lower()
+    
+    # Вкладка "For You" - только карточки с сопоставлением
+    if filter_tag == "for_you":
+        page_index, page_size = _playa_page_args()
+        
+        # Получаем все карточки с сопоставлениями
+        matched = store.get_matched_items()
+        matched_ids = {m['item_id'] for m in matched}
+        
+        # Фильтруем локальные карточки
+        items = _library_items()
+        for_you_items = [i for i in items if str(i.get('id')) in matched_ids]
+        
+        # Пагинация
+        start = page_index * page_size
+        end = start + page_size
+        page_items = for_you_items[start:end]
+        
+        content = [_playa_list_view(item, base_url) for item in page_items]
+        
+        return _playa_response({
+            "page_index": page_index,
+            "page_size": page_size,
+            "page_total": max(1, math.ceil(len(for_you_items) / page_size)),
+            "item_total": len(for_you_items),
+            "content": content,
+        })
+    
+    # Проверяем filter-tag для POVR
+    if filter_tag == "povr":
+        if not POVR_AVAILABLE or not povr_parser_instance:
+            return jsonify({"error": "POVR parser not available"}), 503
+        
+        page_index = request.args.get("page-index", 0, type=int)
+        page_size = request.args.get("page-size", 12, type=int)
+        order = request.args.get("order", "popular")
+        
+        if order == "newest":
+            url = f"https://pornhubvr.com/video?page={page_index + 1}"
+        else:  # popular
+            url = f"https://pornhubvr.com/video?o=mr&page={page_index + 1}"
+        
+        try:
+            videos = povr_parser_instance.parse_video_list(url, page_index + 1)
+            
+            content = []
+            for v in videos[:page_size]:
+                content.append({
+                    "id": f"{POVR_PREFIX}{v['id']}",
+                    "title": v.get("title", "Unknown"),
+                    "preview_image": v.get("poster", ""),
+                    "duration": 0,
+                    "has_scripts": False,
+                })
+            
+            return jsonify({
+                "page_index": page_index,
+                "page_size": page_size,
+                "total_count": len(videos),
+                "content": content,
+            })
+        except Exception as e:
+            log.error("POVR videos error: %s", e)
+            return jsonify({"error": str(e)}), 500
+    
+    # Проверяем filter-tag для PTorrents
+    if filter_tag == "ptorrents":
+        if not config.PTORRENTS_ENABLED:
+            return jsonify({"error": "PTorrents integration is disabled"}), 503
+        
+        page_index, page_size = _playa_page_args()
+        items = _library_items()
+        
+        # Фильтруем только ptorrents
+        ptorrents_items = [i for i in items if i.get("site") == "ptorrents"]
+        
+        # Пагинация
+        start = page_index * page_size
+        end = start + page_size
+        page_items = ptorrents_items[start:end]
+        
+        content = [_playa_list_view(item, base_url) for item in page_items]
+        
+        return _playa_response({
+            "page_index": page_index,
+            "page_size": page_size,
+            "total_count": len(ptorrents_items),
+            "content": content,
+        })
+    
+    # Проверяем filter-tag для источника (pornolab, xxxclub)
+    if filter_tag in ("pornolab", "xxxclub"):
+        page_index, page_size = _playa_page_args()
+        items = _library_items()
+        
+        # Фильтруем по источнику
+        filtered_items = [i for i in items if i.get("site") == filter_tag]
+        
+        # Пагинация
+        start = page_index * page_size
+        end = start + page_size
+        page_items = filtered_items[start:end]
+        
+        content = [_playa_list_view(item, base_url) for item in page_items]
+        
+        return _playa_response({
+            "page_index": page_index,
+            "page_size": page_size,
+            "total_count": len(filtered_items),
+            "content": content,
+        })
+
+
+    # Проверяем фильтры по статусам и категориям (Catalog sources)
+    included_statuses = _csv_ids(_playa_arg("included-statuses") or "")
+    included_categories = _csv_ids(_playa_arg("included-categories") or "")
+    order = _playa_arg("order") or "popularity"
+    
+    # Определяем выбранный источник из статусов
+    catalog_sources = {"pornolab", "xxxclub", "ptorrents", "povr", "vrporn"}
+    selected_source = None
+    for s in included_statuses:
+        if s in catalog_sources:
+            selected_source = s
+            break
+    
+    # Получаем ID актёра для фильтрации
+    actor_filter = (_playa_arg("actor") or "").strip()
+    
+    if selected_source == "povr":
+        # Proxy к POVR API с сортировкой и фильтрацией
+        page_index, page_size = _playa_page_args()
+        from povr_integration import get_povr_videos
+        # Конвертируем сортировку PLAY'a → POVR
+        # По умолчанию newest (свежие релизы как при прямом подключении)
+        povr_order = "newest"
+        if order == "release_date":
+            povr_order = "newest"
+        elif order == "popularity":
+            povr_order = "popular"
+        
+        result = get_povr_videos(page_index, page_size, povr_order, actor_id=actor_filter)
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+        return _playa_response(result)
+    
+    elif selected_source == "vrporn":
+        # Proxy к VRPorn API с сортировкой
+        page_index, page_size = _playa_page_args()
+        from vrporn_integration import get_vrporn_videos
+        # Конвертируем сортировку PLAY'a → VRPorn
+        # По умолчанию newest (свежие релизы)
+        vrporn_order = "newest"
+        if order == "release_date":
+            vrporn_order = "newest"
+        elif order == "popularity":
+            vrporn_order = "popular"
+        
+        result = get_vrporn_videos(page_index, page_size, vrporn_order)
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+        return _playa_response(result)
+    
+    elif selected_source:
+        # Фильтр по конкретному источнику (Catalog) - локальные данные
+        all_items = _library_items()
+        items = [i for i in all_items if i.get("site") == selected_source]
+    elif _XXXCLUB_CATEGORY_ID in included_categories:
+        source_items = _catalog_items()
+        items = _playa_filter_videos(source_items)
+    else:
+        # Обычная лента - только видимые источники
+        has_entity_filter = bool((_playa_arg("actor") or "").strip() or (_playa_arg("studio") or "").strip())
+        source_items = _catalog_items() if has_entity_filter else _library_items()
+        items = _playa_filter_videos(source_items)
+    
     content = [_playa_list_view(item, base_url) for item in items]
 
     # Внешние PLAY'A-сайты показывают на actor page trailer-карточки. Сохраняем
@@ -2469,6 +3148,283 @@ def playa_videos():
 
 @app.get(f"{_PLAYA_PREFIX}/video/<item_id>")
 def playa_video_detail(item_id):
+    # Обработка видео из POVR
+    if item_id.startswith("povr_"):
+        from povr_integration import get_video_details
+        video_data = get_video_details(item_id)
+        
+        if not video_data:
+            return _playa_not_found("Video not found")
+        
+        # Формируем ответ в формате VideoView
+        studio = video_data.get("studio")
+        studio_obj = {"id": str(studio["id"]), "title": studio["title"]} if studio else None
+        
+        actors = [{"id": str(a.get("id", "")), "title": a.get("title", "")} for a in video_data.get("actors", [])]
+        categories = [{"id": str(c.get("id", "")), "title": c.get("title", "")} for c in video_data.get("categories", [])]
+        
+        # Трансформируем details в формат PLAY'a
+        details = []
+        for detail in video_data.get("details", []):
+            detail_obj = {
+                "type": detail.get("type", "trailer"),
+                "duration_seconds": detail.get("duration_seconds", 0),
+            }
+            
+            # Добавляем links
+            links = []
+            for link in detail.get("links", []):
+                links.append({
+                    "is_stream": link.get("is_stream", False),
+                    "url": link.get("url", ""),
+                    "projection": link.get("projection", "180"),
+                    "stereo": link.get("stereo", "LR"),
+                    "quality_name": link.get("quality_name", "HD"),
+                    "quality_order": link.get("quality_order", 0),
+                })
+            
+            if links:
+                detail_obj["links"] = links
+            
+            details.append(detail_obj)
+        
+        return _playa_response({
+            "id": item_id,
+            "title": video_data.get("title", "Unknown"),
+            "subtitle": video_data.get("subtitle", ""),
+            "status": "FULL",
+            "description": video_data.get("description", ""),
+            "preview_image": video_data.get("preview_image", ""),
+            "release_date": video_data.get("release_date", 0),
+            "studio": studio_obj,
+            "categories": categories,
+            "actors": actors,
+            "views": video_data.get("views", 0),
+            "has_scripts": False,
+            "details": details,
+        })
+    
+    # Обработка видео из VRPorn
+    if item_id.startswith("vrporn_"):
+        from vrporn_integration import get_video_details
+        video_data = get_video_details(item_id)
+        
+        if not video_data:
+            return _playa_not_found("Video not found")
+        
+        # Ищем полное видео в локальной БД по названию
+        vrporn_title = video_data.get("title", "").strip()
+        log.info("VRPorn video title: '%s'", vrporn_title)
+        
+        # Извлекаем название из VRPorn (убираем студию если есть)
+        import re as _re
+        # Формат VRPorn: "Studio - Title" или просто "Title"
+        vrporn_parts = vrporn_title.split(' - ', 1)
+        if len(vrporn_parts) == 2:
+            vrporn_actor = vrporn_parts[0].strip()
+            vrporn_scene = vrporn_parts[1].strip()
+        else:
+            vrporn_actor = ""
+            vrporn_scene = vrporn_title
+        
+        # Убираем год из названия сцены
+        vrporn_scene = _re.sub(r'\s*\d{4}$', '', vrporn_scene).strip()
+        
+        log.info("VRPorn parsed: actor='%s', scene='%s'", vrporn_actor, vrporn_scene)
+        
+        # Ищем совпадение в pornolab/ptorrents
+        matched_item = None
+        best_score = 0
+        debug_count = 0
+        
+        for item in store.all_items():
+            if item.get('site') not in ('pornolab', 'ptorrents'):
+                continue
+            
+            item_title = (item.get('title') or '').strip()
+            debug_count += 1
+            
+            # Извлекаем части из pornolab заголовка
+            # Формат: "[Студия] Имя - Название [год]"
+            # Убираем студию в скобках
+            item_title_no_studio = _re.sub(r'^\[[^\]]+\]\s*', '', item_title)
+            
+            # Разделяем по тире
+            item_parts = item_title_no_studio.split(' - ', 1)
+            if len(item_parts) == 2:
+                pornolab_actor = item_parts[0].strip()
+                pornolab_scene = item_parts[1].strip()
+            else:
+                pornolab_actor = ""
+                pornolab_scene = item_title_no_studio
+            
+            # Убираем год из названия
+            pornolab_scene = _re.sub(r'\s*\d{4}$', '', pornolab_scene).strip()
+            
+            # Подсчёт совпадений (приоритет: название > имя)
+            score = 0
+            name_matched = False
+            
+            # Проверка названия (высокий приоритет)
+            if vrporn_scene and pornolab_scene:
+                vrporn_scene_lower = vrporn_scene.lower()
+                pornolab_scene_lower = pornolab_scene.lower()
+                
+                # Точное совпадение
+                if vrporn_scene_lower == pornolab_scene_lower:
+                    score += 100
+                    name_matched = True
+                # Вложенное совпадение
+                elif vrporn_scene_lower in pornolab_scene_lower or pornolab_scene_lower in vrporn_scene_lower:
+                    score += 80
+                    name_matched = True
+                # Совпадение ключевых слов (минимум 3 символа)
+                else:
+                    vrporn_words = set(w.lower() for w in vrporn_scene.split() if len(w) > 3)
+                    pornolab_words = set(w.lower() for w in pornolab_scene.split() if len(w) > 3)
+                    if vrporn_words and pornolab_words:
+                        common = vrporn_words & pornolab_words
+                        overlap = len(common) / max(len(vrporn_words), len(pornolab_words))
+                        if overlap >= 0.5:  # Минимум 50% общих слов
+                            score += int(overlap * 60)
+                            name_matched = True
+            
+            # Проверка имени (бонус только если название совпало)
+            if name_matched and vrporn_actor and pornolab_actor:
+                vrporn_actor_lower = vrporn_actor.lower()
+                pornolab_actor_lower = pornolab_actor.lower()
+                
+                if vrporn_actor_lower == pornolab_actor_lower:
+                    score += 30
+                elif vrporn_actor_lower in pornolab_actor_lower or pornolab_actor_lower in vrporn_actor_lower:
+                    score += 20
+            
+            # Обновляем лучшее совпадение
+            if score > best_score and score >= 80:  # Порог 80 = требуется совпадение названия
+                best_score = score
+                matched_item = item
+                log.info("Match found (score=%d): VRPorn '%s' -> %s '%s'", 
+                        score, vrporn_title, item.get('site'), item.get('title'))
+        
+        if not matched_item:
+            log.info("No local match found for VRPorn video: '%s' (checked %d items)", vrporn_title, debug_count)
+        else:
+            matched_id = str(matched_item.get('id', ''))
+            log.info("Best match for VRPorn '%s': score=%d, title='%s', id=%s", vrporn_title, best_score, matched_item.get('title'), matched_id)
+        
+        # Формируем ответ в формате VideoView
+        studio = video_data.get("studio")
+        studio_obj = {"id": str(studio["id"]), "title": studio["title"]} if studio else None
+        
+        actors = [{"id": str(a.get("id", "")), "title": a.get("title", "")} for a in video_data.get("actors", [])]
+        categories = [{"id": str(c.get("id", "")), "title": c.get("title", "")} for c in video_data.get("categories", [])]
+        
+        # Трансформируем трейлеры из VRPorn в формат PLAY'a
+        details = []
+        for detail in video_data.get("details", []):
+            detail_obj = {
+                "type": detail.get("type", "trailer"),
+                "duration_seconds": detail.get("duration_seconds", 0),
+            }
+            
+            # Добавляем links (фильтруем unavailable/premium)
+            links = []
+            for link in detail.get("links", []):
+                # Пропускаем недоступные/платные ссылки
+                if link.get("unavailable_reason"):
+                    log.info("Skipping unavailable VRPorn link: %s (%s)", link.get("url"), link.get("unavailable_reason"))
+                    continue
+                
+                link_obj = {
+                    "is_stream": link.get("is_stream", False),
+                    "url": link.get("url", ""),
+                    "projection": link.get("projection", "180"),
+                    "stereo": link.get("stereo", "LR"),
+                    "quality_name": link.get("quality_name", "HD"),
+                    "quality_order": link.get("quality_order", 0),
+                }
+                
+                # Добавляем is_download если есть
+                if "is_download" in link:
+                    link_obj["is_download"] = link.get("is_download", False)
+                
+                links.append(link_obj)
+            
+            if links:
+                detail_obj["links"] = links
+            
+            details.append(detail_obj)
+        
+        # Добавляем полное видео из локальной БД если найдено
+        # ВАЖНО: добавляем ПЕРВЫМ, чтобы PLAY'a выбрала full
+        if matched_item:
+            matched_id = str(matched_item.get("id", ""))
+            if matched_id:
+                # Формируем ссылку через /stream/{item_id} endpoint
+                base_url = _base_url()
+                
+                # Маппинг screen_type (dome → 180)
+                screen_type = matched_item.get("screen_type", "").lower()
+                if screen_type in ("dome", "180", "monoscopic"):
+                    projection = "180"
+                elif screen_type == "360":
+                    projection = "360"
+                else:
+                    projection = "180"  # По умолчанию
+                
+                # Определение разрешения
+                video_height = matched_item.get("video_height")
+                if video_height:
+                    quality_name = f"{video_height}p"
+                else:
+                    # Пытаемся извлечь из title
+                    import re as _re
+                    height_match = _re.search(r'(\d{3,4})p', matched_item.get("title", ""))
+                    if height_match:
+                        quality_name = f"{height_match.group(1)}p"
+                    else:
+                        quality_name = "HD"
+                
+                stream_url = f"{base_url}/stream/{urllib.parse.quote(matched_id, safe='')}"
+                
+                full_detail = {
+                    "type": "full",
+                    "duration_seconds": int(matched_item.get("video_length") or 0),
+                    "links": [{
+                        "is_stream": True,
+                        "is_download": True,
+                        "url": stream_url,
+                        "projection": projection,
+                        "stereo": matched_item.get("stereo_mode") == "tb" and "TB" or (matched_item.get("stereo_mode") == "sbs" and "LR" or "MN"),
+                        "quality_name": quality_name,
+                        "quality_order": 100,  # Высокий приоритет для полного видео
+                    }]
+                }
+                # Вставляем full detail ПЕРВЫМ
+                details.insert(0, full_detail)
+                log.info("Found local full video for VRPorn '%s': %s (site=%s, quality=%s, url=%s)", 
+                        video_data.get("title"), matched_id, matched_item.get('site'), quality_name, stream_url)
+        
+        # Определяем статус: если есть full detail — FULL, иначе только трейлеры
+        has_full = any(d.get("type") == "full" for d in details)
+        status = "FULL" if has_full else "TRAILER"
+        
+        return _playa_response({
+            "id": item_id,
+            "title": video_data.get("title", "Unknown"),
+            "subtitle": video_data.get("subtitle", ""),
+            "status": status,
+            "description": video_data.get("description", ""),
+            "preview_image": video_data.get("preview_image", ""),
+            "release_date": video_data.get("release_date", 0),
+            "studio": studio_obj,
+            "categories": categories,
+            "actors": actors,
+            "views": video_data.get("views", 0),
+            "has_scripts": False,
+            "details": details,
+        })
+
     external = _parse_external_video_id(item_id)
     if external:
         try:
@@ -2504,12 +3460,45 @@ def _playa_entity_properties(entry: dict) -> list:
 @app.get(f"{_PLAYA_PREFIX}/actors")
 def playa_actors():
     base_url = _base_url()
+    
+    # Проверяем если выбран POVR или VRPorn
+    included_statuses = _csv_ids(_playa_arg("included-statuses") or "")
+    catalog_sources = {"povr", "vrporn"}
+    selected_source = None
+    for s in included_statuses:
+        if s in catalog_sources:
+            selected_source = s
+            break
+    
+    if selected_source == "povr":
+        # Proxy к POVR API
+        page_index, page_size = _playa_page_args()
+        from povr_integration import get_povr_actors
+        result = get_povr_actors(page_index, page_size)
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+        return _playa_response(result)
+    
+    elif selected_source == "vrporn":
+        # Proxy к VRPorn API
+        page_index, page_size = _playa_page_args()
+        from vrporn_integration import get_vrporn_actors
+        result = get_vrporn_actors(page_index, page_size)
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+        return _playa_response(result)
+    
+    # Локальные данные
     entries = _playa_entity_entries("actor", _catalog_items(), "performers", base_url)
     page_index, page_size = _playa_page_args()
     page = _playa_page(entries, page_index, page_size)
     _playa_schedule_entity_meta_refresh("actor", page["content"], force=_playa_refresh_meta_requested())
     page["content"] = [
-        {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_apply_cached_entity_entry("actor", e)["preview"]}
+        {
+            "id": e["id"],
+            "title": _playa_entity_display_title(e),
+            "preview": _playa_apply_cached_entity_entry("actor", e)["preview"],
+        }
         for e in page["content"]
     ]
     return _playa_response(page)
@@ -2518,6 +3507,25 @@ def playa_actors():
 @app.get(f"{_PLAYA_PREFIX}/actor/<actor_id>")
 def playa_actor_detail(actor_id):
     base_url = _base_url()
+    
+    # Проверяем если это POVR или VRPorn актёр
+    if actor_id.startswith("povr_actor_"):
+        povr_actor_id = actor_id.replace("povr_actor_", "")
+        from povr_integration import get_povr_actor
+        actor = get_povr_actor(povr_actor_id)
+        if not actor:
+            return _playa_not_found("Actor not found")
+        return _playa_response(actor)
+    
+    elif actor_id.startswith("vrporn_actor_"):
+        vrporn_actor_id = actor_id.replace("vrporn_actor_", "")
+        from vrporn_integration import get_vrporn_actor
+        actor = get_vrporn_actor(vrporn_actor_id)
+        if not actor:
+            return _playa_not_found("Actor not found")
+        return _playa_response(actor)
+    
+    # Локальные данные
     entries = _playa_entity_entries("actor", _catalog_items(), "performers", base_url)
     entry = next((e for e in entries if e["id"] == actor_id), None)
     if not entry:
@@ -2541,12 +3549,45 @@ def playa_actor_detail(actor_id):
 @app.get(f"{_PLAYA_PREFIX}/studios")
 def playa_studios():
     base_url = _base_url()
+    
+    # Проверяем если выбран POVR или VRPorn
+    included_statuses = _csv_ids(_playa_arg("included-statuses") or "")
+    catalog_sources = {"povr", "vrporn"}
+    selected_source = None
+    for s in included_statuses:
+        if s in catalog_sources:
+            selected_source = s
+            break
+    
+    if selected_source == "povr":
+        # Proxy к POVR API
+        page_index, page_size = _playa_page_args()
+        from povr_integration import get_povr_studios
+        result = get_povr_studios(page_index, page_size)
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+        return _playa_response(result)
+    
+    elif selected_source == "vrporn":
+        # Proxy к VRPorn API
+        page_index, page_size = _playa_page_args()
+        from vrporn_integration import get_vrporn_studios
+        result = get_vrporn_studios(page_index, page_size)
+        if "error" in result:
+            return jsonify({"error": result["error"]}), 500
+        return _playa_response(result)
+    
+    # Локальные данные
     entries = _playa_entity_entries("studio", _catalog_items(), "studio", base_url)
     page_index, page_size = _playa_page_args()
     page = _playa_page(entries, page_index, page_size)
     _playa_schedule_entity_meta_refresh("studio", page["content"], force=_playa_refresh_meta_requested())
     page["content"] = [
-        {"id": e["id"], "title": _playa_entity_display_title(e), "preview": _playa_apply_cached_entity_entry("studio", e)["preview"]}
+        {
+            "id": e["id"],
+            "title": _playa_entity_display_title(e),
+            "preview": _playa_apply_cached_entity_entry("studio", e)["preview"],
+        }
         for e in page["content"]
     ]
     return _playa_response(page)
@@ -2555,6 +3596,25 @@ def playa_studios():
 @app.get(f"{_PLAYA_PREFIX}/studio/<studio_id>")
 def playa_studio_detail(studio_id):
     base_url = _base_url()
+    
+    # Проверяем если это POVR или VRPorn студия
+    if studio_id.startswith("povr_studio_"):
+        povr_studio_id = studio_id.replace("povr_studio_", "")
+        from povr_integration import get_povr_studio
+        studio = get_povr_studio(povr_studio_id)
+        if not studio:
+            return _playa_not_found("Studio not found")
+        return _playa_response(studio)
+    
+    elif studio_id.startswith("vrporn_studio_"):
+        vrporn_studio_id = studio_id.replace("vrporn_studio_", "")
+        from vrporn_integration import get_vrporn_studio
+        studio = get_vrporn_studio(vrporn_studio_id)
+        if not studio:
+            return _playa_not_found("Studio not found")
+        return _playa_response(studio)
+    
+    # Локальные данные
     entries = _playa_entity_entries("studio", _catalog_items(), "studio", base_url)
     entry = next((e for e in entries if e["id"] == studio_id), None)
     if not entry:
@@ -2567,6 +3627,7 @@ def playa_studio_detail(studio_id):
         "preview": entry["preview"],
         "description": description,
         "views": int(entry["count"]),
+        "lists": studio_lists,  # Списки в которых находится эта студия
     })
 
 
@@ -2582,7 +3643,18 @@ def _playa_content_type_categories(base_url: str) -> list:
 @app.get(f"{_PLAYA_PREFIX}/categories;")
 def playa_categories():
     base_url = _base_url()
-    return _playa_response(_playa_content_type_categories(base_url) + _playa_category_entries(_library_items(), base_url))
+    
+    content_categories = _playa_content_type_categories(base_url)
+    tags = _playa_category_entries(_library_items(), base_url)
+    
+    # Тестовые вкладки
+    custom_categories = [
+        {"id": _TEST_TAB_1_CATEGORY_ID, "title": "Test Tab 1", "preview": _placeholder_url(base_url)},
+        {"id": _TEST_TAB_2_CATEGORY_ID, "title": "Test Tab 2", "preview": _placeholder_url(base_url)},
+        {"id": _TEST_TAB_3_CATEGORY_ID, "title": "Test Tab 3", "preview": _placeholder_url(base_url)},
+    ]
+    
+    return _playa_response(content_categories + tags + custom_categories)
 
 
 @app.get(f"{_PLAYA_PREFIX}/categories-groups")
@@ -2590,16 +3662,51 @@ def playa_categories():
 def playa_categories_groups():
     base_url = _base_url()
     categories = _playa_category_entries(_library_items(), base_url)
+    
+    # Добавляем XXXClub и тестовые вкладки
+    source_items = [
+        {"id": _XXXCLUB_CATEGORY_ID, "title": "XXXClub", "preview": _placeholder_url(base_url)}
+    ]
+    test_items = [
+        {"id": _TEST_TAB_1_CATEGORY_ID, "title": "Test Tab 1", "preview": _placeholder_url(base_url)},
+        {"id": _TEST_TAB_2_CATEGORY_ID, "title": "Test Tab 2", "preview": _placeholder_url(base_url)},
+        {"id": _TEST_TAB_3_CATEGORY_ID, "title": "Test Tab 3", "preview": _placeholder_url(base_url)},
+    ]
+    
+    # Каталоги - выбор источника
+    catalog_items = [
+        {"id": "catalog_pornolab", "title": "Pornolab", "preview": _placeholder_url(base_url)},
+        {"id": "catalog_xxxclub", "title": "XXXClub", "preview": _placeholder_url(base_url)},
+    ]
+    if config.PTORRENTS_ENABLED:
+        catalog_items.append({"id": "catalog_ptorrents", "title": "PTorrents", "preview": _placeholder_url(base_url)})
+    if POVR_AVAILABLE:
+        catalog_items.append({"id": "catalog_povr", "title": "POVR", "preview": _placeholder_url(base_url)})
+    
     return _playa_response([
         {"id": "content_type", "title": "Content", "items": _playa_content_type_categories(base_url)},
+        {"id": "sources", "title": "Sources", "items": source_items},
+        {"id": "catalogs", "title": "Catalogs", "items": catalog_items},
         {"id": "tags", "title": "Tags", "items": categories},
+        {"id": "test_tabs", "title": "Test Tabs", "items": test_items},
     ])
 
 
 @app.get(f"{_PLAYA_PREFIX}/video-statuses")
 @app.get(f"{_PLAYA_PREFIX}/video-statuses;")
 def playa_video_statuses():
-    return _playa_response([])
+    """Catalog sources as statuses - shown in 'Statuses' panel at top of right sidebar."""
+    statuses = [
+        {"id": "pornolab", "title": "Pornolab"},
+        {"id": "xxxclub", "title": "XXXClub"},
+    ]
+    if config.PTORRENTS_ENABLED:
+        statuses.append({"id": "ptorrents", "title": "PTorrents"})
+    if config.POVR_ENABLED:
+        statuses.append({"id": "povr", "title": "POVR"})
+    if config.VRPORN_ENABLED:
+        statuses.append({"id": "vrporn", "title": "VRPorn"})
+    return _playa_response(statuses)
 
 
 @app.route(f"{_PLAYA_PREFIX}/event", methods=["PUT", "POST"])
@@ -2760,6 +3867,7 @@ def thumb_proxy(item_id):
     return Response(r.content, mimetype=r.headers.get("Content-Type", "image/jpeg"))
 
 
+
 def _background_refresh_loop():
     while True:
         try:
@@ -2769,7 +3877,178 @@ def _background_refresh_loop():
         time.sleep(max(config.REFRESH_INTERVAL_SEC, 60))
 
 
+# === Endpoints для сопоставления (новый PlayaMatcher) ===
+
+@app.get("/api/match/all")
+def match_all():
+    """Запустить прогон сопоставления через PlayaMatcher."""
+    matcher_inst = _get_matcher()
+    if matcher_inst is None:
+        return jsonify({'error': 'PlayaMatcher not initialized. Run load_catalog.py first'}), 503
+    
+    try:
+        new_only = request.args.get('new_only', 'true').lower() in ('true', '1', 'yes')
+        try:
+            limit = int(request.args.get('limit', '500'))
+        except (ValueError, TypeError):
+            limit = 500
+        limit = max(1, min(limit, 100000))
+        
+        # Собираем карточки для сопоставления
+        all_items = store.all_items()
+        local_items = [i for i in all_items if i.get('site') in ('pornolab', 'ptorrents')]
+        
+        if new_only:
+            local_items = [i for i in local_items if not store.has_match_cache(str(i.get('id', '')))]
+        
+        local_items = local_items[:limit]
+        
+        if not local_items:
+            return jsonify({'success': True, 'stats': {'matched': 0, 'total': 0, 'skipped': 0, 'failed': 0}})
+        
+        titles = [item.get('title', '') for item in local_items]
+        
+        # Пакетное сопоставление
+        log.info("Starting batch match for %d items...", len(titles))
+        start_time = time.time()
+        results = matcher_inst.match_batch(titles, top_k=1)
+        elapsed = time.time() - start_time
+        
+        # Сохраняем результаты
+        matched_count = 0
+        failed_count = 0
+        for item, matches in zip(local_items, results):
+            item_id = str(item.get('id', ''))
+            if matches and len(matches) > 0:
+                best = matches[0]
+                confidence = best.get('confidence', 0)
+                
+                if confidence >= 80.0:
+                    video = best.get('video', {})
+                    store.save_match_cache(
+                        item_id=item_id,
+                        provider=video.get('site', ''),
+                        external_id=video.get('video_id', ''),
+                        match_score=int(confidence * 10),
+                        match_type='full_with_trailer',
+                        auto_matched=True,
+                    )
+                    matched_count += 1
+            else:
+                failed_count += 1
+        
+        log.info("Batch match completed: %d/%d matched in %.1f sec", matched_count, len(local_items), elapsed)
+        
+        return jsonify({
+            'success': True,
+            'stats': {
+                'matched': matched_count,
+                'total': len(local_items),
+                'skipped': len(local_items) - matched_count - failed_count,
+                'failed': failed_count,
+                'elapsed_sec': round(elapsed, 1),
+            }
+        })
+    except Exception as e:
+        log.error("Match all failed: %s", e, exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.get("/api/match/stats")
+def match_stats():
+    """Получить статистику сопоставлений."""
+    try:
+        matcher_inst = _get_matcher()
+        all_items = store.all_items()
+        local_items = len([i for i in all_items if i.get('site') in ('pornolab', 'ptorrents')])
+        
+        # Считаем карточки с сопоставлениями
+        matched_count = 0
+        for item in all_items[:1000]:  # Ограничиваем выборку для скорости
+            if item.get('site') in ('pornolab', 'ptorrents'):
+                if store.has_match_cache(str(item.get('id', ''))):
+                    matched_count += 1
+        
+        catalog_total = 0
+        if matcher_inst:
+            catalog_total = matcher_inst.db.count_videos() if matcher_inst.db else 0
+        
+        return jsonify({
+            'local_items': local_items,
+            'matched_items': matched_count,
+            'catalog_videos': catalog_total,
+            'match_rate': f"{matched_count / local_items * 100:.1f}%" if local_items > 0 else "0%",
+        })
+    except Exception as e:
+        log.error("Stats failed: %s", e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.get("/api/match/clear")
+def match_clear():
+    """Очистить все сопоставления."""
+    store.clear_match_cache()
+    return jsonify({'success': True, 'message': 'Все сопоставления очищены'})
+
+
+@app.get("/api/match/<item_id>")
+def match_info(item_id):
+    """Получить информацию о сопоставлении конкретной карточки."""
+    match = store.get_match_cache(item_id)
+    if not match:
+        return jsonify({'error': 'not found'}), 404
+    
+    # Получаем данные VRPorn видео
+    vrporn_data = None
+    if match.get('provider') == 'vrporn':
+        try:
+            from vrporn_integration import get_video_details
+            vrporn_data = get_video_details(match['external_id'])
+        except Exception as e:
+            log.warning("Failed to get VRPorn details: %s", e)
+    
+    # Получаем локальную карточку
+    item = store.get_item(item_id)
+    
+    return jsonify({
+        'item_id': item_id,
+        'item_title': item.get('title') if item else None,
+        'match': match,
+        'vrporn_data': vrporn_data,
+    })
+
+
+@app.get("/api/match/duplicates")
+def match_duplicates():
+    """Найти VRPorn ID которые маппятся на несколько локальных карточек."""
+    import sqlite3
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT external_id, COUNT(*) as cnt, GROUP_CONCAT(item_id) as item_ids
+        FROM match_cache
+        WHERE provider = 'vrporn'
+        GROUP BY external_id
+        HAVING cnt > 1
+        ORDER BY cnt DESC
+        LIMIT 50
+        """
+    ).fetchall()
+    
+    duplicates = []
+    for row in rows:
+        duplicates.append({
+            'vrporn_id': row['external_id'],
+            'count': row['cnt'],
+            'item_ids': row['item_ids'].split(','),
+        })
+    
+    return jsonify({'duplicates': duplicates, 'total': len(duplicates)})
+
+
 if __name__ == "__main__":
     if config.REFRESH_INTERVAL_SEC > 0:
         threading.Thread(target=_background_refresh_loop, daemon=True).start()
     app.run(host=config.BRIDGE_HOST, port=config.BRIDGE_PORT, debug=False, threaded=True)
+
