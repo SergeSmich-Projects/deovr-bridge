@@ -107,7 +107,11 @@ SIGNAL_MARKERS = (
     ("cloudflare", ("cloudflare", "checking your browser", "cf-chl")),
     ("ddos-guard", ("ddos-guard",)),
     ("access-denied", ("access denied", "доступ запрещён", "403 forbidden")),
-    ("login-page", ("login.php", "you must login", "войти на форум")),
+    # «login.php» намеренно НЕ включён: форумы семейства rutracker (pornolab и др.)
+    # вставляют форму входа в шапку КАЖДОЙ страницы — строка login.php присутствует
+    # и на полностью рабочей странице раздела. Ложный триггер. Настоящую логин-стену
+    # определяет _detect_login_wall() по редиректу или title страницы.
+    ("login-page", ("you must login", "войти на форум")),
 )
 
 
@@ -212,6 +216,40 @@ def _detect_signals(text: str) -> list:
     return [name for name, markers in SIGNAL_MARKERS if any(m in head for m in markers)]
 
 
+def _detect_login_wall(result: dict) -> bool:
+    """Настоящие признаки логин-стены (в отличие от простого наличия login.php в теле).
+
+    Форумы семейства rutracker (pornolab и т.п.) вставляют форму входа в шапку
+    КАЖДОЙ страницы — строка login.php есть даже на полностью рабочих страницах
+    раздела, доступных анонимно. Поэтому «login.php в теле» — ложный сигнал.
+
+    Реальная логин-стена определяется по одному из:
+      1) Редирект на login.php (final_url содержит login.php).
+      2) Title страницы — «Вход» / «Log in» / «Login» (страница формы входа,
+         а не запрошенный контент).
+    """
+    final_url = (result.get("final_url") or "").lower()
+    title = (result.get("title") or "").lower().strip()
+
+    # 1) Сервер перенаправил на страницу логина
+    if "login.php" in final_url or "/login" in final_url:
+        return True
+
+    # 2) Страница — сама форма входа (title совпадает с типовыми заголовками)
+    login_titles = (
+        "вход",
+        "авторизация",
+        "log in",
+        "login",
+        "sign in",
+    )
+    for prefix in login_titles:
+        if title.startswith(prefix):
+            return True
+
+    return False
+
+
 def _redact(data: bytes) -> tuple:
     hits = 0
     for pattern, replacement in REDACTIONS:
@@ -300,6 +338,8 @@ def _probe(target: dict, max_body: int, timeout: float, out_dir: str) -> dict:
     text = _decode(redacted, result["content_type"])
     result["title"] = _extract_title(text)
     result["signals"] = _detect_signals(text)
+    if _detect_login_wall(result) and "login-page" not in result["signals"]:
+        result["signals"].append("login-page")
     return result
 
 

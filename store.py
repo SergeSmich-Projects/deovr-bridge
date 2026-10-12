@@ -6,6 +6,7 @@ import sqlite3
 import json
 import time
 import threading
+from typing import Optional
 
 import config
 
@@ -230,6 +231,24 @@ def init_db():
             )
             """
         )
+
+        # Кэш сопоставлений VRPorn/POVR ←→ pornolab/ptorrents
+        # Используется для вкладки "For You" и отображения статусов на карточках
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS match_cache (
+                item_id TEXT NOT NULL,
+                provider TEXT NOT NULL,        -- vrporn или povr
+                external_id TEXT NOT NULL,
+                match_score INTEGER,
+                match_type TEXT NOT NULL,      -- full_with_trailer | trailer_only | full_only
+                auto_matched INTEGER DEFAULT 0,
+                matched_at INTEGER,
+                PRIMARY KEY (item_id, provider)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_match_cache_external ON match_cache(provider, external_id)")
 
         _db_initialized = True
         _db_initialized_path = config.DB_PATH
@@ -693,6 +712,23 @@ def external_scene_matches(provider: str, external_id: str) -> list:
 def external_matches_for_item(item_id: str) -> list:
     ensure_db()
     with _lock, _conn() as conn:
+        # Сначала ищем в match_cache (новые сопоставления)
+        mc_rows = conn.execute(
+            """
+            SELECT mc.provider, mc.external_id, mc.match_score as score, mc.match_type, mc.auto_matched,
+                   es.title, es.subtitle, es.preview_url, es.trailer_duration
+            FROM match_cache mc
+            LEFT JOIN external_scenes es ON es.provider=mc.provider AND es.external_id=mc.external_id
+            WHERE mc.item_id=?
+            ORDER BY mc.match_score DESC
+            """,
+            (item_id,),
+        ).fetchall()
+        
+        if mc_rows:
+            return [dict(row) for row in mc_rows]
+        
+        # Fallback на старую таблицу external_scene_matches
         rows = conn.execute(
             """
             SELECT m.*, s.title, s.subtitle, s.preview_url, s.trailer_duration
@@ -743,3 +779,98 @@ def save_crawl_state(section_url: str, cursor_page: int, complete: bool = False,
             """,
             (section_url, cursor_page, 1 if complete else 0, pages_fetched_seq),
         )
+
+
+# === Кэш сопоставлений (match_cache) ===
+
+def save_match_cache(item_id: str, provider: str, external_id: str, match_score: int, match_type: str, auto_matched: bool = False):
+    """Сохраняет результат сопоставления."""
+    ensure_db()
+    with _lock, _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO match_cache (item_id, provider, external_id, match_score, match_type, auto_matched, matched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id, provider) DO UPDATE SET
+                external_id=excluded.external_id,
+                match_score=excluded.match_score,
+                match_type=excluded.match_type,
+                auto_matched=excluded.auto_matched,
+                matched_at=excluded.matched_at
+            """,
+            (item_id, provider, external_id, match_score, match_type, 1 if auto_matched else 0, int(time.time())),
+        )
+
+
+def get_match_cache(item_id: str, provider: str = None) -> Optional[dict]:
+    """Получает сохранённое сопоставление для карточки."""
+    ensure_db()
+    with _lock, _conn() as conn:
+        if provider:
+            r = conn.execute(
+                "SELECT * FROM match_cache WHERE item_id = ? AND provider = ?", (item_id, provider)
+            ).fetchone()
+        else:
+            r = conn.execute(
+                "SELECT * FROM match_cache WHERE item_id = ? ORDER BY matched_at DESC LIMIT 1", (item_id,)
+            ).fetchone()
+        return dict(r) if r else None
+
+
+def get_matched_items(provider: str = None) -> list:
+    """Получает все карточки с сопоставлениями (для вкладки For You)."""
+    ensure_db()
+    with _lock, _conn() as conn:
+        if provider:
+            rows = conn.execute(
+                """
+                SELECT mc.*, i.title as item_title, i.site as item_site, i.tags, i.performers, i.studio, i.video_height
+                FROM match_cache mc
+                JOIN items i ON mc.item_id = i.id
+                WHERE mc.provider = ?
+                ORDER BY mc.matched_at DESC
+                """,
+                (provider,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT mc.*, i.title as item_title, i.site as item_site, i.tags, i.performers, i.studio, i.video_height
+                FROM match_cache mc
+                JOIN items i ON mc.item_id = i.id
+                ORDER BY mc.matched_at DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def has_match_cache(item_id: str) -> bool:
+    """Проверяет наличие сопоставления для карточки."""
+    ensure_db()
+    with _lock, _conn() as conn:
+        r = conn.execute("SELECT COUNT(*) as cnt FROM match_cache WHERE item_id = ?", (item_id,)).fetchone()
+        return r["cnt"] > 0 if r else False
+
+
+def get_match_cache_by_external(external_id: str, provider: str) -> Optional[dict]:
+    """Получает сопоставление по external_id."""
+    ensure_db()
+    with _lock, _conn() as conn:
+        r = conn.execute(
+            "SELECT * FROM match_cache WHERE external_id = ? AND provider = ?",
+            (external_id, provider)
+        ).fetchone()
+        return dict(r) if r else None
+
+
+def clear_match_cache(item_id: str = None, provider: str = None):
+    """Очищает кэш сопоставлений."""
+    ensure_db()
+    with _lock, _conn() as conn:
+        if item_id:
+            if provider:
+                conn.execute("DELETE FROM match_cache WHERE item_id = ? AND provider = ?", (item_id, provider))
+            else:
+                conn.execute("DELETE FROM match_cache WHERE item_id = ?", (item_id,))
+        else:
+            conn.execute("DELETE FROM match_cache")

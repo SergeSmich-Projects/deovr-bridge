@@ -183,11 +183,13 @@ MAX_SCENE_ITEMS = int(os.environ.get("MAX_SCENE_ITEMS", "400"))
 
 # Источники, которые уже можно продолжать скрапить/держать в БД, но временно НЕ
 # показывать в пользовательских библиотеках (/deovr, /heresphere, PLAYA API).
-# Сейчас xxxclub скрыт по просьбе пользователя: вернём выдачу карточек позже,
-# когда отдельно проверим качество метаданных и поведение плееров.
+# Сейчас xxxclub и knaben скрыты по просьбе пользователя:
+# - xxxclub: вернём выдачу карточек позже, когда отдельно проверим качество метаданных
+# - knaben: нужен только для поиска альтернативных раздач (дублей) если на основном
+#   источнике (pornolab) не хватает сидов, а не для показа в общем списке
 HIDDEN_LIBRARY_SITE_IDS = {
     part.strip()
-    for part in os.environ.get("HIDDEN_LIBRARY_SITE_IDS", "xxxclub").split(",")
+    for part in os.environ.get("HIDDEN_LIBRARY_SITE_IDS", "xxxclub,knaben").split(",")
     if part.strip()
 }
 
@@ -196,14 +198,18 @@ HIDDEN_LIBRARY_SITE_IDS = {
 # и кэшировать только URL в БД. Если внешние сайты недоступны или хочется
 # полностью офлайн-режим - поставьте 0.
 ENABLE_EXTERNAL_ENTITY_META = os.environ.get("ENABLE_EXTERNAL_ENTITY_META", "1").lower() not in ("0", "false", "no")
-EXTERNAL_ENTITY_META_TTL_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TTL_SEC", str(30 * 24 * 3600)))
+EXTERNAL_ENTITY_META_TTL_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TTL_SEC", str(60 * 24 * 3600)))
 EXTERNAL_ENTITY_META_TIMEOUT_SEC = int(os.environ.get("EXTERNAL_ENTITY_META_TIMEOUT_SEC", "8"))
-POVR_BASE_URL = os.environ.get("POVR_BASE_URL", "https://povr.com")
+POVR_BASE_URL = os.environ.get("POVR_BASE_URL", "https://pornhubvr.com")
 VRSPY_BASE_URL = os.environ.get("VRSPY_BASE_URL", "https://www.vrspy.com")
 VRPORN_BASE_URL = os.environ.get("VRPORN_BASE_URL", "https://vrporn.com")
 # Трейлерные карточки внешних PLAY'A-каталогов. Списки сцен кэшируются локально,
 # но подписанные media URL всегда запрашиваются заново при открытии карточки.
 ENABLE_EXTERNAL_TRAILERS = os.environ.get("ENABLE_EXTERNAL_TRAILERS", "1").lower() not in ("0", "false", "no")
+
+# Автоматическое сопоставление карточек
+ENABLE_AUTO_MATCH = os.environ.get("ENABLE_AUTO_MATCH", "1").lower() not in ("0", "false", "no")
+ENABLE_DAILY_MATCH = os.environ.get("ENABLE_DAILY_MATCH", "0").lower() not in ("0", "false", "no")
 EXTERNAL_TRAILER_CATALOG_TTL_SEC = int(os.environ.get("EXTERNAL_TRAILER_CATALOG_TTL_SEC", str(24 * 3600)))
 # Опциональные структурированные metadata-провайдеры Stash-Box (например,
 # ThePornDB/StashDB). Формат env:
@@ -334,6 +340,14 @@ XXXCLUB_QUICK_SCAN_MAX_ITEMS = int(os.environ.get("XXXCLUB_QUICK_SCAN_MAX_ITEMS"
 # запоминается в БД между перезапусками, как и у остальных источников)
 XXXCLUB_BACKFILL_PAGES_PER_CYCLE = int(os.environ.get("XXXCLUB_BACKFILL_PAGES_PER_CYCLE", "5"))
 
+# PTorrents.com settings
+PTORRENTS_ENABLED = os.environ.get("PTORRENTS_ENABLED", "1").lower() in ("1", "true", "yes")
+POVR_ENABLED = os.environ.get("POVR_ENABLED", "0").lower() in ("1", "true", "yes")
+VRPORN_ENABLED = os.environ.get("VRPORN_ENABLED", "0").lower() in ("1", "true", "yes")
+PTORRENTS_BASE_URL = os.environ.get("PTORRENTS_BASE_URL", "https://ptorrents.com")
+PTORRENTS_MAX_PAGES = int(os.environ.get("PTORRENTS_MAX_PAGES", "340"))
+PTORRENTS_ITEMS_PER_PAGE = int(os.environ.get("PTORRENTS_ITEMS_PER_PAGE", "50"))
+
 # Список "источников" (сайтов), которые обходит scraper.py. Каждый - независимая
 # сессия/куки/селекторы. Порядок = порядок вкладок в DeoVR.
 FORUM_SITES = [
@@ -377,6 +391,16 @@ FORUM_SITES = [
         "impersonate": None,        # антибота нет - обычный requests, без curl_cffi
     },
     {
+        "id": "ptorrents",
+        "name": "PTorrents",
+        "base_url": PTORRENTS_BASE_URL,
+        "engine": "ptorrents",
+        "cookie_file": "",
+        "id_prefix": "pt_",
+        "max_pages": PTORRENTS_MAX_PAGES,
+        "impersonate": "chrome131",
+    },
+    {
         "id": "knaben",
         "name": "Knaben",
         "base_url": KNABEN_API_URL,
@@ -385,3 +409,9 @@ FORUM_SITES = [
         "id_prefix": "kn_",
     },
 ]
+
+# AstalaVR Cloudflare cf_clearance cookie
+# Значение из DevTools браузера (Application → Cookies → astalavr.com → cf_clearance)
+# Без этой переменной CDN будет возвращать 403 на всех видео
+import os as _os
+ASTALAVR_CF_CLEARANCE = _os.environ.get("ASTALAVR_CF_CLEARANCE", "")

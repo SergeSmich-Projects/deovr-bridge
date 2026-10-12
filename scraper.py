@@ -878,7 +878,66 @@ def _xxxclub_parse_details(site: dict, detail_path: str) -> dict:
     if og and og.get("content"):
         poster = og["content"]
 
-    return {"magnet": magnet, "collection": collection, "poster": poster}
+    # Извлекаем seeders/leechers из detailsdescr
+    seeders = 0
+    leechers = 0
+    downloads = 0
+    
+    details_div = soup.find("div", class_="detailsdescr")
+    if details_div:
+        for li in details_div.find_all("li"):
+            spans = li.find_all("span")
+            if len(spans) >= 3:
+                label = spans[0].get_text(strip=True)
+                value = spans[-1].get_text(strip=True)
+                
+                if label == "Peers":
+                    # Парсим "24 seeders , 50 leechers"
+                    font_see = li.find("font", class_="see")
+                    font_lee = li.find("font", class_="lee")
+                    if font_see:
+                        seeders = int(font_see.get_text(strip=True) or 0)
+                    if font_lee:
+                        leechers = int(font_lee.get_text(strip=True) or 0)
+                elif label == "Downloads":
+                    try:
+                        downloads = int(value)
+                    except ValueError:
+                        downloads = 0
+
+    # Парсим Media Info из описания
+    video_length = 0
+    video_height = 0
+    
+    description_text = ""
+    desc_div = soup.find("div", class_="detailsdescr")
+    if desc_div:
+        description_text = desc_div.get_text()
+    
+    # Duration: 45 min 26 s
+    duration_match = re.search(r"Duration[.:]\s*(\d+)\s*min\s*(\d+)?\s*s?", description_text, re.IGNORECASE)
+    if duration_match:
+        minutes = int(duration_match.group(1))
+        seconds = int(duration_match.group(2) or 0)
+        video_length = minutes * 60 + seconds
+    
+    # Resolution: 7200x3600 (берём высоту = 3600)
+    resolution_match = re.search(r"Resolution[.:]\s*(\d+)x(\d+)", description_text, re.IGNORECASE)
+    if resolution_match:
+        width = int(resolution_match.group(1))
+        height = int(resolution_match.group(2))
+        video_height = max(width, height)  # берём максимальную сторону
+
+    return {
+        "magnet": magnet,
+        "collection": collection,
+        "poster": poster,
+        "seeders": seeders,
+        "leechers": leechers,
+        "downloads": downloads,
+        "video_length": video_length,
+        "video_height": video_height,
+    }
 
 
 def _xxxclub_item_id(site: dict, path: str) -> str:
@@ -914,11 +973,15 @@ def _parse_and_store_xxxclub_item(site: dict, row: dict, source_rank: int = 9999
         "source": details["magnet"],
         "screen_type": screen,
         "stereo_mode": stereo,
-        "video_length": 0,
+        "video_length": details.get("video_length", 0),
+        "video_height": details.get("video_height", 0),
         "studio": tags,
         "performers": [],
         "site": site_id,
         "source_rank": source_rank,
+        "seeders": details.get("seeders", 0),
+        "leechers": details.get("leechers", 0),
+        "views": details.get("downloads", 0),  # downloads как proxy для views
     }
     store.upsert_item(item)
     return True
@@ -1200,9 +1263,29 @@ def refresh_all():
                 # импорте app/scraper и не загружает provider, когда он выключен.
                 import knaben  # noqa: PLC0415
                 total_seen += knaben.refresh()
+            elif site.get("engine") == "ptorrents":
+                # PTorrents - ленивая загрузка торрентов (только метаданные)
+                from ptorrents_integration import refresh_ptorrents  # noqa: PLC0415
+                total_seen += refresh_ptorrents()
             else:
                 total_seen += _refresh_site(site)
         except Exception as e:
             log.exception("[%s] Ошибка обновления источника: %s", site["id"], e)
+    
+    # POVR - отдельный источник (не форум)
+    try:
+        if config.POVR_ENABLED:
+            from povr_integration import refresh_povr  # noqa: PLC0415
+            total_seen += refresh_povr()
+    except Exception as e:
+        log.exception("POVR: Ошибка обновления источника: %s", e)
+    
+    # VRPorn - отдельный источник (не форум)
+    try:
+        if config.VRPORN_ENABLED:
+            from vrporn_integration import refresh_vrporn  # noqa: PLC0415
+            total_seen += refresh_vrporn()
+    except Exception as e:
+        log.exception("VRPorn: Ошибка обновления источника: %s", e)
     log.info("Обновление завершено по всем источникам, новых тем добавлено: %s", total_seen)
     return total_seen
