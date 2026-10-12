@@ -840,6 +840,18 @@ class PlayaApiClient:
         rec.details_fetched = 1
         db.upsert_videos([rec])
         return rec
+    
+    def fetch_video_links(self, video_id: str) -> Optional[Dict[str, Any]]:
+        """Получает details с links для видео (трейлеры, полное видео)."""
+        data = self.get_json(f"video/{video_id}")
+        if not data:
+            return None
+        # Возвращаем details с links
+        return {
+            "id": video_id,
+            "title": data.get("title", ""),
+            "details": data.get("details", []),
+        }
 
 
 # =============================================================================
@@ -1236,6 +1248,17 @@ class PlayaMatcher:
         confidence = max(0.0, min(100.0, round(raw_total, 1)))
         method = "exact_studio_title" if (best_title_sim >= 98.0 and studio_bonus >= 14.0) else "fuzzy_multi_feature"
         return confidence, method, breakdown
+    
+    def get_video_links(self, site: str, video_id: str) -> Optional[Dict[str, Any]]:
+        """Получает details с links для видео из API."""
+        client = self.api_clients.get(site)
+        if not client:
+            return None
+        try:
+            return client.fetch_video_links(video_id)
+        except Exception as e:
+            logger.warning("Failed to fetch video links for %s/%s: %s", site, video_id, e)
+            return None
 
     def match_one(
         self,

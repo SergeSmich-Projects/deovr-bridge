@@ -2330,13 +2330,10 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
             
             if provider and ext_id:
                 try:
-                    # Подтягиваем детали видео из API
-                    if 'vrporn' in provider.lower():
-                        from vrporn_integration import get_video_details as get_vrporn_details
-                        vrporn_data = get_vrporn_details(ext_id)
-                    elif 'povr' in provider.lower():
-                        from povr_integration import get_video_details as get_povr_details
-                        vrporn_data = get_povr_details(ext_id)
+                    # Получаем details через PlayaMatcher
+                    matcher_inst = _get_matcher()
+                    if matcher_inst:
+                        vrporn_data = matcher_inst.get_video_links(provider, ext_id)
                     else:
                         vrporn_data = None
                     
@@ -2382,14 +2379,13 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
                     title = item.get('title', '')
                     results = matcher_inst.match_one(title, top_k=1, verify_details=False)
                     
-                    if results and results.get('matches'):
-                        best = results['matches'][0]
-                        confidence = best.get('confidence', 0)
+                    best_match = results.get('best_match')
+                    if best_match and best_match.get('status') == 'auto_matched':
+                        confidence = best_match.get('confidence', 0)
                         
                         if confidence >= 80.0:  # Уверенное сопоставление
-                            video = best.get('video', {})
-                            site = video.get('site', '')
-                            vid = video.get('video_id', '')
+                            site = best_match.get('site', '')
+                            vid = best_match.get('video_id', '')
                             
                             if site and vid:
                                 # Сохраняем сопоставление
@@ -2399,12 +2395,43 @@ def _playa_video_view(item: dict, base_url: str) -> dict:
                                     external_id=vid,
                                     match_score=int(confidence * 10),
                                     match_type='full_with_trailer',
-                                    auto_matched=False,
+                                    auto_matched=True,
                                 )
-                                log.info("Auto-matched local item %s -> %s/%s (confidence=%.1f)", 
-                                         item_id, site, vid, confidence)
+                                
+                                # Получаем трейлер
+                                vrporn_data = matcher_inst.get_video_links(site, vid)
+                                if vrporn_data and 'details' in vrporn_data:
+                                    trailers = []
+                                    for detail in vrporn_data['details']:
+                                        if detail.get('type') != 'trailer':
+                                            continue
+                                        filtered_links = []
+                                        for link in detail.get('links', []):
+                                            if link.get('unavailable_reason'):
+                                                continue
+                                            filtered_links.append({
+                                                "is_stream": link.get("is_stream", True),
+                                                "is_download": link.get("is_download", False),
+                                                "url": link.get("url", ""),
+                                                "projection": link.get("projection", "180"),
+                                                "stereo": link.get("stereo", "LR"),
+                                                "quality_name": link.get("quality_name", "HD"),
+                                                "quality_order": link.get("quality_order", 0),
+                                            })
+                                        if filtered_links:
+                                            trailers.append({
+                                                "type": "trailer",
+                                                "duration_seconds": detail.get("duration_seconds", 0),
+                                                "links": filtered_links,
+                                            })
+                                    
+                                    if trailers:
+                                        result["details"] = trailers + result["details"]
+                                        result["status"] = "FULL + TRAILER"
+                                        result["counterpart_trailer_id"] = vid
+                                        log.info("Found and added trailer for local item %s: %s", item_id, vid)
             except Exception as e:
-                log.warning("Matcher lookup failed for %s: %s", item_id, e)
+                log.warning("Failed to find trailer for %s: %s", item_id, e)
         
         # Fallback на старую таблицу external_scene_matches
         if not match_cache:
