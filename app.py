@@ -45,20 +45,21 @@ import matcher
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
 
+# POVR integration (optional)
+POVR_AVAILABLE = False
+povr_parser_instance = None
+POVR_PREFIX = "povr_"
+
 try:
     import povr_parser
     POVR_AVAILABLE = True
-except ImportError:
-    POVR_AVAILABLE = False
-    log.warning("povr_parser not available. Install: pip install cloudscraper beautifulsoup4")
-
-if POVR_AVAILABLE:
     cf_clearance = getattr(config, 'POVR_CF_CLEARANCE', '')
     povr_parser_instance = povr_parser.POVRParser(cf_clearance=cf_clearance or None)
-else:
-    povr_parser_instance = None
-
-POVR_PREFIX = "povr_"
+    log.info("POVR parser loaded successfully")
+except ImportError:
+    log.info("POVR parser not available (povr_parser.py not found)")
+except Exception as e:
+    log.warning("POVR parser init failed: %s", e)
 
 app = Flask(__name__)
 store.init_db()
