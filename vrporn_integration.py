@@ -11,6 +11,17 @@ _cache = {}
 _cache_ttl = 300  # 5 минут
 
 
+def refresh_vrporn():
+    """
+    Обновить список VRPorn через Playa API.
+    
+    TODO: Реализовать парсинг VRPorn через Playa API.
+    Сейчас заглушка — возвращает 0 новых тем.
+    """
+    log.info("VRPorn refresh: парсинг не реализован, используется существующая база")
+    return 0
+
+
 def _get_client():
     """Получить PlayaApiClient для VRPorn."""
     try:
@@ -72,6 +83,10 @@ def get_vrporn_videos(page_index=0, page_size=12, order="newest", **kwargs):
 
 def get_video_details(video_id):
     """Получить детали видео VRPorn."""
+    # Убираем префикс vrporn_ если есть
+    if video_id.startswith("vrporn_"):
+        video_id = video_id[7:]
+    
     cache_key = f"details_{video_id}"
     if cache_key in _cache and time.time() - _cache[cache_key]['time'] < _cache_ttl:
         return _cache[cache_key]['data']
@@ -91,6 +106,10 @@ def get_video_details(video_id):
 
 def get_stream_for_video(video_id):
     """Получить ссылку на стриминг видео."""
+    # Убираем префикс vrporn_ если есть
+    if video_id.startswith("vrporn_"):
+        video_id = video_id[7:]
+    
     # VRPorn не поддерживает прямой стриминг через наш API
     # Возвращаем ссылку на трейлер
     details = get_video_details(video_id)

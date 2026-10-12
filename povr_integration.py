@@ -11,6 +11,17 @@ _cache = {}
 _cache_ttl = 300  # 5 минут
 
 
+def refresh_povr():
+    """
+    Обновить список POVR через Playa API.
+    
+    TODO: Реализовать парсинг POVR через Playa API.
+    Сейчас заглушка — возвращает 0 новых тем.
+    """
+    log.info("POVR refresh: парсинг не реализован, используется существующая база")
+    return 0
+
+
 def _get_client():
     """Получить PlayaApiClient для POVR."""
     try:
@@ -75,6 +86,10 @@ def get_povr_videos(page_index=0, page_size=12, order="newest", actor_id=None, *
 
 def get_video_details(video_id):
     """Получить детали видео POVR."""
+    # Убираем префикс povr_ если есть
+    if video_id.startswith("povr_"):
+        video_id = video_id[5:]
+    
     cache_key = f"details_{video_id}"
     if cache_key in _cache and time.time() - _cache[cache_key]['time'] < _cache_ttl:
         return _cache[cache_key]['data']
@@ -94,6 +109,10 @@ def get_video_details(video_id):
 
 def get_stream_for_video(video_id):
     """Получить ссылку на стриминг видео."""
+    # Убираем префикс povr_ если есть
+    if video_id.startswith("povr_"):
+        video_id = video_id[5:]
+    
     # POVR не поддерживает прямой стриминг через наш API
     # Возвращаем ссылку на трейлер
     details = get_video_details(video_id)
