@@ -2,6 +2,7 @@
 """
 Загрузка каталога API vrporn.com и povr.com в локальную БД
 """
+import os
 import sys
 import time
 import logging
@@ -15,8 +16,11 @@ def load_catalog():
     try:
         from matcher import PlayaCatalogDB, PlayaApiClient
         
+        # Путь к БД — рядом с этим скриптом
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playa_catalog.db")
+        
         # 1. Создаём БД
-        db = PlayaCatalogDB("playa_catalog.db")
+        db = PlayaCatalogDB(db_path)
         log.info(f"Текущее количество видео: {db.count_videos()}")
         
         # 2. Создаём клиенты

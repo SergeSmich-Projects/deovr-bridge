@@ -85,25 +85,34 @@ def _get_matcher():
             db_path = os.path.join(os.path.dirname(__file__), "playa_catalog.db")
             db = PlayaCatalogDB(db_path)
             
+            # Проверяем есть ли данные в БД
+            vrporn_count = db.count_videos('vrporn.com')
+            povr_count = db.count_videos('povr.com')
+            
+            if vrporn_count == 0 and povr_count == 0:
+                # Каталог пуст — запускаем автозагрузку
+                log.info("playa_catalog.db пуст — запускаю автозагрузку каталога...")
+                try:
+                    from load_catalog import load_catalog
+                    load_catalog()
+                    vrporn_count = db.count_videos('vrporn.com')
+                    povr_count = db.count_videos('povr.com')
+                    log.info("Автозагрузка завершена: %d VRPorn + %d POVR видео", vrporn_count, povr_count)
+                except Exception as e:
+                    log.error("Ошибка автозагрузки каталога: %s", e, exc_info=True)
+                    return None
+            
             clients = {}
-            if os.path.exists(db_path):
-                # Проверяем есть ли данные в БД
-                vrporn_count = db.count_videos('vrporn.com')
-                povr_count = db.count_videos('povr.com')
-                
-                if vrporn_count > 0 or povr_count > 0:
-                    log.info("Загрузка PlayaMatcher: %d VRPorn + %d POVR видео", vrporn_count, povr_count)
-                    if vrporn_count > 0:
-                        clients['vrporn.com'] = PlayaApiClient('vrporn.com', request_delay=0.3)
-                    if povr_count > 0:
-                        clients['povr.com'] = PlayaApiClient('povr.com', request_delay=0.5)
-                    
-                    _matcher_instance = PlayaMatcher(db, api_clients=clients)
-                    log.info("PlayaMatcher инициализирован успешно")
-                else:
-                    log.warning("playa_catalog.db пуст — запустите load_catalog.py")
+            if vrporn_count > 0:
+                clients['vrporn.com'] = PlayaApiClient('vrporn.com', request_delay=0.3)
+            if povr_count > 0:
+                clients['povr.com'] = PlayaApiClient('povr.com', request_delay=0.5)
+            
+            if clients:
+                _matcher_instance = PlayaMatcher(db, api_clients=clients)
+                log.info("PlayaMatcher инициализирован: %d VRPorn + %d POVR видео", vrporn_count, povr_count)
             else:
-                log.warning("playa_catalog.db не найден — запустите load_catalog.py")
+                log.warning("Не удалось инициализировать PlayaMatcher — нет данных в каталоге")
         except Exception as e:
             log.error("Ошибка инициализации PlayaMatcher: %s", e, exc_info=True)
         

@@ -16,3 +16,5 @@ antibot_captcha/pending.json
 antibot_captcha/candidate_*.jpg
 antibot_captcha/reference.jpg
 antibot_captcha/reference.png
+playa_catalog.db
+catalog_load.log
