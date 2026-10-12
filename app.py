@@ -822,33 +822,46 @@ def video_detail(item_id):
 @app.get("/stream/<item_id>")
 def stream_redirect(item_id):
     """
-    Единственное место, где реально качается .torrent/добавляется magnet в
-    TorrServe - сюда плеер обращается ТОЛЬКО когда по-настоящему начинает
-    читать видео-поток (т.е. пользователь реально нажал play), а не просто
-    при подгрузке карточки/метаданных (см. комментарий в video_detail()).
-    Результаты actor/studio matching могут происходить из скрытого в общей
-    ленте источника, поэтому воспроизводить разрешаем любую индексированную запись.
-    
+    Стриминг видео для всех источников:
+    - Pornolab/XXXClub/Knaben: через torrserve.resolve_stream_url с cookies
+    - PTorrents: через dl.php?t={id} → TorrServe
+    - VRPorn/POVR: через PlayaMatcher API → прямой трейлер
     """
-    # Обработка PTorrents (ленивая загрузка торрентов)
+    # Обработка VRPorn/POVR из каталога Playa (не из локальной БД)
+    if item_id.isdigit():
+        # Пытаемся найти в Playa каталоге и вернуть трейлер
+        from matcher import PlayaCatalogDB
+        import os
+        db_path = os.path.join(os.path.dirname(__file__), "playa_catalog.db")
+        if os.path.exists(db_path):
+            try:
+                db = PlayaCatalogDB(db_path)
+                rec = db.get_video_by_id(item_id)
+                if rec:
+                    site = rec.site
+                    matcher_inst = _get_matcher()
+                    if matcher_inst:
+                        api_data = matcher_inst.get_video_links(site, item_id)
+                        if api_data:
+                            # Находим первый трейлер с ссылками
+                            for detail in api_data.get('details', []):
+                                if detail.get('type') == 'trailer':
+                                    links = detail.get('links', [])
+                                    if links:
+                                        stream_url = links[0].get('url', '')
+                                        if stream_url:
+                                            return redirect(stream_url, code=302)
+            except Exception as e:
+                log.debug("Playa catalog lookup failed for %s: %s", item_id, e)
+    
+    # Обработка PTorrents (ленивая загрузка через dl.php)
     if item_id.startswith("pt_"):
         try:
-            from ptorrents_integration import get_torrent_for_video
-            magnet_url = get_torrent_for_video(item_id)
+            from ptorrents_integration import get_stream_for_video
+            stream_url = get_stream_for_video(item_id)
             
-            if not magnet_url:
+            if not stream_url:
                 return jsonify({"error": "Failed to get torrent for PTorrents video"}), 502
-            
-            # Получаем item из store (теперь с magnet_url)
-            item = store.get_item(item_id)
-            if not item:
-                return jsonify({"error": "not found"}), 404
-            
-            try:
-                stream_url = _resolve_cached_stream_url(item)
-            except Exception as e:
-                log.exception("Не удалось получить поток из TorrServe для %s: %s", item_id, e)
-                return jsonify({"error": f"torrserve error: {e}"}), 502
             
             return redirect(stream_url, code=302)
             
@@ -856,7 +869,7 @@ def stream_redirect(item_id):
             log.exception("PTorrents stream error for %s: %s", item_id, e)
             return jsonify({"error": f"ptorrents error: {e}"}), 502
     
-    # Обработка POVR (прямые mp4 ссылки)
+    # Обработка POVR (прямые ссылки на трейлеры)
     if item_id.startswith("povr_"):
         try:
             from povr_integration import get_stream_for_video
@@ -871,7 +884,7 @@ def stream_redirect(item_id):
             log.exception("POVR stream error for %s: %s", item_id, e)
             return jsonify({"error": f"povr error: {e}"}), 502
     
-    # Обработка VRPorn (прямые mp4 ссылки)
+    # Обработка VRPorn (прямые ссылки на трейлеры)
     if item_id.startswith("vrporn_"):
         try:
             from vrporn_integration import get_stream_for_video
@@ -886,7 +899,7 @@ def stream_redirect(item_id):
             log.exception("VRPorn stream error for %s: %s", item_id, e)
             return jsonify({"error": f"vrporn error: {e}"}), 502
     
-    # Обычная обработка торрентов
+    # Стандартная обработка для Pornolab/XXXClub/Knaben через TorrServe
     item = store.get_item(item_id)
     if not item:
         return jsonify({"error": "not found"}), 404
